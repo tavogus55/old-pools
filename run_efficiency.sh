@@ -11,6 +11,7 @@ SPARSE_MODELS=(topk sag ndp graclus count1 count2 count4 ndrp)
 DENSE_MODELS=(diff mincut unif gaus)
 DATASETS=(DD IMDB-BINARY IMDB-MULTI MUTAG NCI1 NCI109 PROTEINS)
 MODELS=("${SPARSE_MODELS[@]}" "${DENSE_MODELS[@]}")
+EXP_NAME="${1:-efficiency}"
 
 TOTAL_EXPERIMENTS=$((${#MODELS[@]} * ${#DATASETS[@]}))
 
@@ -20,6 +21,7 @@ echo "========================================="
 echo "Sparse methods: ${SPARSE_MODELS[*]}"
 echo "Dense methods : ${DENSE_MODELS[*]}"
 echo "Datasets      : ${DATASETS[*]}"
+echo "Experiment name: ${EXP_NAME}"
 echo "Total         : ${TOTAL_EXPERIMENTS}"
 echo ""
 echo "Experiment order"
@@ -54,7 +56,7 @@ for MODEL in "${MODELS[@]}"; do
         python main.py \
             --methods "${MODEL}" \
             --dataset "${DATASET}" \
-            --exp-name efficiency
+            --exp-name "${EXP_NAME}"
 
         EXIT_CODE=$?
         if [ "${EXIT_CODE}" -ne 0 ]; then

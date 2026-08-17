@@ -17,6 +17,19 @@ from models import AVAILABLE_METHODS, DENSE_METHODS, build_model
 from utils import evaluate, get_logger, log_experiment_settings, save_to_csv, set_seed
 
 
+MAX_NODES_BY_DATASET = {
+    # TU datasets (benchmark settings shared with new-pools).
+    'MUTAG': 150,
+    'DD': 500,
+    'IMDB-MULTI': 500,
+    'PROTEINS': 700,
+    'IMDB-BINARY': 500,
+    'COLLAB': 150,
+    'NCI1': 150,
+    'NCI109': 150,
+}
+
+
 def get_device():
     if torch.cuda.is_available():
         return torch.device('cuda')
@@ -79,8 +92,6 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--weight-decay', type=float, default=1e-4)
     parser.add_argument('--pool-ratio', type=float, default=0.5)
-    parser.add_argument('--max-nodes', type=int, default=None)
-    parser.add_argument('--quantile', type=float, default=0.95)
     parser.add_argument('--early-stop', type=int, default=2000)
     parser.add_argument('--tolerance', type=float, default=1e-4)
     parser.add_argument('--log-level', type=str, default='info',
@@ -107,14 +118,22 @@ def main():
     methods = parse_methods(args.methods)
     device = get_device()
 
+    try:
+        max_nodes = MAX_NODES_BY_DATASET[args.dataset]
+    except KeyError as exc:
+        supported = ', '.join(sorted(MAX_NODES_BY_DATASET))
+        raise ValueError(
+            f'Unsupported dataset {args.dataset!r}. '
+            f'Fixed max-node settings are available for: {supported}'
+        ) from exc
+
     if hasattr(torch, 'set_float32_matmul_precision'):
         torch.set_float32_matmul_precision('high')
 
     sparse_graphs, dense_graphs, in_channels, num_classes, max_nodes = load_tu_graphs(
         root=args.root,
         name=args.dataset,
-        max_nodes=args.max_nodes,
-        quantile=args.quantile,
+        max_nodes=max_nodes,
         use_node_attr=True,
     )
 
