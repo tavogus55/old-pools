@@ -1,0 +1,9 @@
+/pythonProject3/
+data/
+.idea/
+.DS_Store
+*.pyc
+global_setting.json
+global_settings.json
+logs/
+results/
