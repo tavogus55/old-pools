@@ -1,7 +1,9 @@
 import argparse
+import json
 from pathlib import Path
 import random
 import time
+from datetime import datetime
 
 import torch
 from sklearn.metrics import accuracy_score, f1_score
@@ -10,6 +12,7 @@ from torch_geometric.datasets import TUDataset
 from torch_geometric.loader import DataLoader
 
 from pooling_models import DensePool, sparse_pooling
+from utils import get_logger, log_experiment_settings, save_to_csv
 
 
 DENSE_MAX_NODES = {
@@ -83,6 +86,9 @@ def main(
     batch_size: int,
     k_folds: int,
     seeds,
+    logger,
+    args,
+    timestamp: str,
 ) -> None:
     project_dir = Path(__file__).resolve().parent
     data_dir = project_dir / "data"
@@ -108,7 +114,7 @@ def main(
         dataset = [data for data in dataset if data.num_nodes <= max_nodes]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    logger.info(f"Using device: {device}")
 
     criterion = torch.nn.CrossEntropyLoss()
     indices = list(range(len(dataset)))
@@ -117,6 +123,7 @@ def main(
     fold_times = []
     fold_memories = []
     fold_metrics = []
+    validation_fold_metrics = []
 
     total_runs = len(seeds) * k_folds
     for run, (seed, (train_val_indices, test_indices)) in enumerate(
@@ -172,7 +179,7 @@ def main(
             weight_decay=weight_decay,
         )
 
-        print(
+        logger.info(
             f"Seed {seed}, Fold {fold}/{k_folds}: "
             f"train={len(train_dataset)}, "
             f"validation={len(validation_dataset)}, test={len(test_dataset)}"
@@ -216,7 +223,7 @@ def main(
                 torch.cuda.synchronize(device)
             average_loss = total_loss / len(train_loader)
             epoch_duration = time.perf_counter() - epoch_start
-            print(
+            logger.info(
                 f"Seed {seed}, Fold {fold} Epoch {epoch}/{epochs} "
                 f"- loss: {average_loss:.4f} "
                 f"- Epoch Time: {epoch_duration:.2f}s "
@@ -235,13 +242,14 @@ def main(
         )
         test_metrics = evaluate_classification(model, test_loader, device)
         fold_metrics.append(test_metrics)
-        print(
+        validation_fold_metrics.append(validation_metrics)
+        logger.info(
             f"Seed {seed}, Fold {fold} validation - "
             f"Accuracy: {validation_metrics['accuracy']:.4f}, "
             f"Micro-F1: {validation_metrics['micro_f1']:.4f}, "
             f"Macro-F1: {validation_metrics['macro_f1']:.4f}"
         )
-        print(
+        logger.info(
             f"Seed {seed}, Fold {fold} test - "
             f"Accuracy: {test_metrics['accuracy']:.4f}, "
             f"Micro-F1: {test_metrics['micro_f1']:.4f}, "
@@ -249,30 +257,48 @@ def main(
         )
 
     total_training_time = sum(fold_times)
-    print(
+    logger.info(
         f"Total training time across {total_runs} fold/seed runs: "
         f"{total_training_time:.2f}s"
     )
-    print(f"Average training time per run: {sum(fold_times) / total_runs:.2f}s")
+    logger.info(f"Average training time per run: {sum(fold_times) / total_runs:.2f}s")
 
     average_metrics = {
-        key: sum(metrics[key] for metrics in fold_metrics) / k_folds
+        key: sum(metrics[key] for metrics in fold_metrics) / total_runs
         for key in fold_metrics[0]
     }
-    print(f"Average Accuracy: {average_metrics['accuracy']:.4f}")
-    print(f"Average Micro-F1: {average_metrics['micro_f1']:.4f}")
-    print(f"Average Macro-F1: {average_metrics['macro_f1']:.4f}")
+    logger.info(f"Average Accuracy: {average_metrics['accuracy']:.4f}")
+    logger.info(f"Average Micro-F1: {average_metrics['micro_f1']:.4f}")
+    logger.info(f"Average Macro-F1: {average_metrics['macro_f1']:.4f}")
 
     if device.type == "cuda":
-        print(
+        logger.info(
             f"Average GPU memory reserved: "
             f"{sum(fold_memories) / len(fold_memories):.2f} MB"
         )
     else:
-        print("GPU usage: unavailable (running on CPU)")
+        logger.info("GPU usage: unavailable (running on CPU)")
 
-    print(f"Loaded {len(dataset)} graphs from the {dataset_name} TU dataset.")
-    print(f"Saved dataset to {output_path}")
+    logger.info(f"Loaded {len(dataset)} graphs from the {dataset_name} TU dataset.")
+    logger.info(f"Saved dataset to {output_path}")
+
+    save_to_csv(
+        args=args,
+        task_type="multiclass",
+        timestamp=timestamp,
+        times=fold_times,
+        memories=fold_memories if fold_memories else [0.0],
+        max_nodes=max_nodes,
+        best_val_accs=[
+            metrics["accuracy"] for metrics in validation_fold_metrics
+        ],
+        best_test_accs=[
+            metrics["accuracy"] for metrics in fold_metrics
+        ],
+        best_test_macro_f1s=[
+            metrics["macro_f1"] for metrics in fold_metrics
+        ],
+    )
 
 
 if __name__ == "__main__":
@@ -328,13 +354,17 @@ if __name__ == "__main__":
         help="Pooling ratio.",
     )
     parser.add_argument(
+        "--lr",
         "--learning-rate",
+        dest="lr",
         type=float,
         default=1e-3,
         help="Optimizer learning rate.",
     )
     parser.add_argument(
+        "--weight_decay",
         "--weight-decay",
+        dest="weight_decay",
         type=float,
         default=1e-4,
         help="Optimizer weight decay.",
@@ -352,29 +382,66 @@ if __name__ == "__main__":
         help="Training batch size.",
     )
     parser.add_argument(
+        "--k_folds",
         "--k-folds",
+        dest="k_folds",
         type=int,
-        default=2,
+        default=10,
         help="Number of shuffled cross-validation folds.",
     )
     parser.add_argument(
         "--seeds",
-        type=int,
+        type=str,
         nargs="+",
-        default=list(range(42, 43)),
+        default=[str(seed) for seed in range(42, 52)],
         help="Random seeds to run for every fold.",
     )
+    parser.add_argument(
+        "--log_level",
+        choices=("debug", "info", "warning", "error", "critical"),
+        default="info",
+    )
+    parser.add_argument("--log_path", default="local")
+    parser.add_argument("--exp_name", default="exp")
+    parser.add_argument("--tolerance", type=float, default=1e-4)
+    parser.add_argument("--early_stop", type=int, default=50)
+    parser.add_argument("--cuda", action="store_true")
+    parser.add_argument("--ddp", action="store_true")
     args = parser.parse_args()
+    args.seeds = [
+        int(seed)
+        for seed_group in args.seeds
+        for seed in seed_group.split(",")
+        if seed
+    ]
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    logger_settings = {
+        "logger": {
+            "model": args.model,
+            "log_path": args.log_path,
+            "dataset": args.dataset,
+            "log_level": args.log_level.upper(),
+        }
+    }
+    with open("global_settings.json", "w") as file:
+        json.dump(logger_settings, file, indent=4)
+
+    logger = get_logger(args.exp_name, timestamp)
+    log_experiment_settings(logger, args)
     main(
         args.dataset,
         args.model,
         args.epochs,
         args.hidden,
         args.pratio,
-        args.learning_rate,
+        args.lr,
         args.weight_decay,
         args.dropout,
         args.batch_size,
         args.k_folds,
         args.seeds,
+        logger,
+        args,
+        timestamp,
     )
