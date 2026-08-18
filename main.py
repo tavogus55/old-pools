@@ -6,7 +6,19 @@ import torch
 from torch_geometric.datasets import TUDataset
 from torch_geometric.loader import DataLoader
 
-from pooling_models import sparse_pooling
+from pooling_models import DensePool, sparse_pooling
+
+
+DENSE_MAX_NODES = {
+    "MUTAG": 150,
+    "DD": 500,
+    "IMDB-MULTI": 500,
+    "PROTEINS": 700,
+    "IMDB-BINARY": 500,
+    "COLLAB": 150,
+    "NCI1": 150,
+    "NCI109": 150,
+}
 
 
 def main(
@@ -27,19 +39,45 @@ def main(
     output_path = data_dir / f"{dataset_name}.pt"
     torch.save(dataset, output_path)
 
+    is_dense = model_name in {
+        "diff",
+        "mincut",
+        "gaus",
+        "unif",
+        "count1",
+        "count2",
+        "count4",
+    }
+    max_nodes = DENSE_MAX_NODES[dataset_name] if is_dense else None
+    input_dim = max(1, dataset.num_features)
+    num_classes = dataset.num_classes
+
+    if is_dense:
+        dataset = [data for data in dataset if data.num_nodes <= max_nodes]
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    input_dim = max(1, dataset.num_features)
-    model = sparse_pooling(
-        input_dim,
-        dataset.num_classes,
-        model=model_name,
-        hidden=hidden,
-        pratio=pratio,
-        dropout=dropout,
-    ).to(device)
+    if is_dense:
+        model = DensePool(
+            input_dim,
+            num_classes,
+            model=model_name,
+            hidden=hidden,
+            pratio=pratio,
+            dropout=dropout,
+            max_nodes=max_nodes,
+        ).to(device)
+    else:
+        model = sparse_pooling(
+            input_dim,
+            num_classes,
+            model=model_name,
+            hidden=hidden,
+            pratio=pratio,
+            dropout=dropout,
+        ).to(device)
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=learning_rate,
@@ -70,7 +108,10 @@ def main(
             else:
                 x = batch.x
             output = model(x, batch.edge_index, batch.batch)
-            loss = criterion(output, batch.y)
+            auxiliary_loss = getattr(model, "last_auxiliary_loss", None)
+            if auxiliary_loss is None:
+                auxiliary_loss = output.new_zeros(())
+            loss = criterion(output, batch.y) + auxiliary_loss
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
@@ -112,7 +153,18 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--model",
-        choices=("sag", "topk", "ndrp"),
+        choices=(
+            "sag",
+            "topk",
+            "ndrp",
+            "diff",
+            "mincut",
+            "gaus",
+            "unif",
+            "count1",
+            "count2",
+            "count4",
+        ),
         default="topk",
         help="Pooling layer to use.",
     )
