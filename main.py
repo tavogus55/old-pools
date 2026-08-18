@@ -13,6 +13,8 @@ def main(
     dataset_name: str,
     model_name: str,
     epochs: int,
+    hidden: int,
+    pratio: float,
     learning_rate: float,
     weight_decay: float,
     dropout: float,
@@ -31,6 +33,8 @@ def main(
         input_dim,
         dataset.num_classes,
         model=model_name,
+        hidden=hidden,
+        pratio=pratio,
         dropout=dropout,
     )
     optimizer = torch.optim.Adam(
@@ -106,6 +110,18 @@ if __name__ == "__main__":
         help="Number of training epochs.",
     )
     parser.add_argument(
+        "--hidden",
+        type=int,
+        default=32,
+        help="Node embedding hidden dimension.",
+    )
+    parser.add_argument(
+        "--pratio",
+        type=float,
+        default=0.5,
+        help="Pooling ratio.",
+    )
+    parser.add_argument(
         "--learning-rate",
         type=float,
         default=1e-3,
@@ -134,6 +150,8 @@ if __name__ == "__main__":
         args.dataset,
         args.model,
         args.epochs,
+        args.hidden,
+        args.pratio,
         args.learning_rate,
         args.weight_decay,
         args.dropout,

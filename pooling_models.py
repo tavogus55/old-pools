@@ -54,6 +54,8 @@ class SparsePooling(nn.Module):
         input_dim: int,
         num_classes: int,
         model: str = "topk",
+        hidden: int = 32,
+        pratio: float = 0.5,
         dropout: float = 0.5,
     ):
         super().__init__()
@@ -61,9 +63,9 @@ class SparsePooling(nn.Module):
         if model not in {"sag", "topk", "ndrp"}:
             raise ValueError("model must be one of 'sag', 'topk', or 'ndrp'")
 
-        self.conv1 = GCNConv(input_dim, 32)
-        self.conv2 = GCNConv(32, 32)
-        self.conv3 = GCNConv(32, 32)
+        self.conv1 = GCNConv(input_dim, hidden)
+        self.conv2 = GCNConv(hidden, hidden)
+        self.conv3 = GCNConv(hidden, hidden)
 
         if model == "sag":
             pooling_layer = SAGPooling
@@ -71,12 +73,12 @@ class SparsePooling(nn.Module):
             pooling_layer = TopKPooling
         else:
             pooling_layer = NDRPPooling
-        self.pool1 = pooling_layer(32, ratio=0.5)
-        self.pool2 = pooling_layer(32, ratio=0.5)
+        self.pool1 = pooling_layer(hidden, ratio=pratio)
+        self.pool2 = pooling_layer(hidden, ratio=pratio)
 
         self.model = model
         self.dropout = nn.Dropout(dropout)
-        self.classifier = nn.Linear(64, num_classes)
+        self.classifier = nn.Linear(2 * hidden, num_classes)
 
     def forward(self, x, edge_index, batch):
         # GCNConv: input_dim -> 32
