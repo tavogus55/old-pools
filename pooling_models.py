@@ -1,3 +1,5 @@
+import time
+
 import torch
 from torch import nn
 from torch_geometric.nn import (
@@ -8,6 +10,32 @@ from torch_geometric.nn import (
     global_mean_pool,
 )
 from torch_geometric.utils import subgraph
+from torch_scatter import scatter_add
+
+
+def batched_random_topk(batch, ratio):
+    """Select a uniformly random, rounded-ratio subset from each graph."""
+    num_nodes = scatter_add(
+        batch.new_ones(batch.size(0)),
+        batch,
+        dim=0,
+    )
+    keep = (ratio * num_nodes.to(torch.float)).round().to(torch.long).clamp_min_(1)
+
+    # Ranking i.i.d. random scores is uniform sampling without replacement.
+    scores = torch.rand(batch.size(0), device=batch.device)
+    _, perm = torch.sort(scores, descending=True)
+    sorted_batch, batch_order = torch.sort(batch[perm])
+    perm = perm[batch_order]
+
+    graph_offsets = torch.cat(
+        [num_nodes.new_zeros(1), num_nodes.cumsum(dim=0)[:-1]]
+    )
+    node_positions = torch.arange(
+        batch.size(0), device=batch.device
+    ) - graph_offsets[sorted_batch]
+    selected = node_positions < keep[sorted_batch]
+    return perm[selected]
 
 
 class NDRPPooling(nn.Module):
@@ -23,16 +51,7 @@ class NDRPPooling(nn.Module):
             batch = x.new_zeros(x.size(0), dtype=torch.long)
 
         original_num_nodes = x.size(0)
-        selected_nodes = []
-        for graph_id in batch.unique(sorted=True):
-            graph_nodes = (batch == graph_id).nonzero(as_tuple=False).view(-1)
-            node_count = max(1, int(round(self.ratio * graph_nodes.numel())))
-            selected = graph_nodes[
-                torch.randperm(graph_nodes.numel(), device=x.device)[:node_count]
-            ]
-            selected_nodes.append(selected)
-
-        perm = torch.cat(selected_nodes)
+        perm = batched_random_topk(batch, self.ratio)
         x = x[perm]
         batch = batch[perm]
         edge_index, edge_attr = subgraph(
@@ -79,8 +98,23 @@ class SparsePooling(nn.Module):
         self.model = model
         self.dropout = nn.Dropout(dropout)
         self.classifier = nn.Linear(2 * hidden, num_classes)
+        self.last_pool_time = 0.0
+
+    def _timed_pool(self, pool, x, edge_index, batch):
+        if x.is_cuda:
+            torch.cuda.synchronize(x.device)
+        pool_start = time.perf_counter()
+
+        result = pool(x, edge_index, batch=batch)
+
+        if x.is_cuda:
+            torch.cuda.synchronize(x.device)
+        self.last_pool_time += time.perf_counter() - pool_start
+        return result
 
     def forward(self, x, edge_index, batch):
+        self.last_pool_time = 0.0
+
         # GCNConv: input_dim -> 32
         x = self.conv1(x, edge_index)
 
@@ -91,8 +125,8 @@ class SparsePooling(nn.Module):
         x = self.dropout(x)
 
         # Pooling: ratio = 0.5
-        x, edge_index, _, batch, _, _ = self.pool1(
-            x, edge_index, batch=batch
+        x, edge_index, _, batch, _, _ = self._timed_pool(
+            self.pool1, x, edge_index, batch
         )
 
         # GCNConv: 32 -> 32
@@ -105,8 +139,8 @@ class SparsePooling(nn.Module):
         x = self.dropout(x)
 
         # Pooling: ratio = 0.5
-        x, edge_index, _, batch, _, _ = self.pool2(
-            x, edge_index, batch=batch
+        x, edge_index, _, batch, _, _ = self._timed_pool(
+            self.pool2, x, edge_index, batch
         )
 
         # GCNConv: 32 -> 32

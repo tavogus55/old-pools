@@ -27,6 +27,9 @@ def main(
     output_path = data_dir / f"{dataset_name}.pt"
     torch.save(dataset, output_path)
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     input_dim = max(1, dataset.num_features)
     model = sparse_pooling(
@@ -36,7 +39,7 @@ def main(
         hidden=hidden,
         pratio=pratio,
         dropout=dropout,
-    )
+    ).to(device)
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=learning_rate,
@@ -45,12 +48,18 @@ def main(
     criterion = torch.nn.CrossEntropyLoss()
 
     model.train()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
     training_start = time.perf_counter()
     for epoch in range(1, epochs + 1):
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
         epoch_start = time.perf_counter()
         total_loss = 0.0
+        total_pool_time = 0.0
 
         for batch in loader:
+            batch = batch.to(device)
             optimizer.zero_grad()
             if batch.x is None or batch.x.size(1) == 0:
                 x = torch.ones(
@@ -65,12 +74,16 @@ def main(
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
+            total_pool_time += model.last_pool_time
 
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
         average_loss = total_loss / len(loader)
         epoch_duration = time.perf_counter() - epoch_start
         print(
             f"Epoch {epoch}/{epochs} - loss: {average_loss:.4f} "
-            f"- time: {epoch_duration:.2f}s"
+            f"- Epoch Time: {epoch_duration:.2f}s "
+            f"- Pool Time: {total_pool_time:.2f}s"
         )
 
     total_training_time = time.perf_counter() - training_start
