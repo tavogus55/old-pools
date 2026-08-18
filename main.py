@@ -324,6 +324,7 @@ if __name__ == "__main__":
             "sag",
             "topk",
             "ndrp",
+            "ndp",
             "diff",
             "mincut",
             "gaus",

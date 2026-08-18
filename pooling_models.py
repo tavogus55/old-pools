@@ -13,7 +13,7 @@ from torch_geometric.nn import (
     dense_mincut_pool,
 )
 from torch_geometric.utils import subgraph, to_dense_adj, to_dense_batch
-from torch_scatter import scatter_add
+from torch_scatter import scatter_add, scatter_max, scatter_min
 
 
 def batched_random_topk(batch, ratio):
@@ -39,6 +39,38 @@ def batched_random_topk(batch, ratio):
     ) - graph_offsets[sorted_batch]
     selected = node_positions < keep[sorted_batch]
     return perm[selected]
+
+
+def maximal_independent_set(edge_index, num_nodes=None):
+    """Return a greedy maximal independent set as a boolean node mask."""
+    if num_nodes is None:
+        num_nodes = int(edge_index.max().item()) + 1 if edge_index.numel() else 0
+
+    row, col = edge_index
+    rank = torch.arange(num_nodes, device=edge_index.device)
+    mis = torch.zeros(num_nodes, dtype=torch.bool, device=edge_index.device)
+    active = mis.clone()
+    min_rank = rank.clone()
+
+    while not active.all():
+        minimum = torch.full_like(min_rank, num_nodes)
+        scatter_min(min_rank[row], col, out=minimum)
+        torch.minimum(minimum, min_rank, out=min_rank)
+        mis |= rank == min_rank
+
+        active = mis.clone()
+        maximum = torch.zeros(
+            num_nodes,
+            dtype=torch.long,
+            device=edge_index.device,
+        )
+        scatter_max(active[row].to(torch.long), col, out=maximum)
+        active |= maximum.bool()
+
+        min_rank = rank.clone()
+        min_rank[active] = num_nodes
+
+    return mis
 
 
 class NDRPPooling(nn.Module):
@@ -68,6 +100,80 @@ class NDRPPooling(nn.Module):
         return x, edge_index, edge_attr, batch, perm, x.new_ones(x.size(0))
 
 
+class NDPPooling(nn.Module):
+    """Decimation pooling using a maximal independent set."""
+
+    def __init__(self, input_dim: int, ratio: float = 0.5):
+        super().__init__()
+        self.input_dim = input_dim
+        self.ratio = ratio
+
+    def forward(self, x, edge_index, edge_attr=None, batch=None):
+        if batch is None:
+            batch = edge_index.new_zeros(x.size(0))
+
+        num_nodes = x.size(0)
+        if edge_index.numel() == 0:
+            perm = torch.arange(num_nodes, device=x.device)
+            return x, edge_index, edge_attr, batch, perm, x.new_ones(num_nodes)
+
+        mis = maximal_independent_set(edge_index, num_nodes=num_nodes)
+        graph_count = int(batch.max().item()) + 1
+        graph_counts = scatter_add(
+            batch.new_ones(num_nodes), batch, dim=0, dim_size=graph_count
+        )
+        graph_starts = torch.cat([
+            graph_counts.new_zeros(1),
+            graph_counts.cumsum(dim=0)[:-1],
+        ])
+        graph_keep = (
+            graph_counts.to(torch.float) * self.ratio
+        ).long().clamp_min(1)
+
+        selected = mis.nonzero(as_tuple=False).view(-1)
+        selected_batch = batch[selected]
+        selected_counts = scatter_add(
+            selected_batch.new_ones(selected_batch.numel()),
+            selected_batch,
+            dim=0,
+            dim_size=graph_count,
+        )
+        selected_offsets = selected_counts.cumsum(0) - selected_counts
+        selected_rank = (
+            torch.arange(selected.numel(), device=x.device)
+            - torch.repeat_interleave(selected_offsets, selected_counts)
+        )
+        perm = selected[
+            selected_rank < graph_keep[selected_batch]
+        ]
+
+        missing = (selected_counts == 0).nonzero(as_tuple=False).view(-1)
+        if missing.numel() > 0:
+            missing_counts = graph_keep[missing]
+            missing_offsets = missing_counts.cumsum(0) - missing_counts
+            missing_rank = (
+                torch.arange(missing_counts.sum(), device=x.device)
+                - torch.repeat_interleave(missing_offsets, missing_counts)
+            )
+            fallback = (
+                graph_starts[missing].repeat_interleave(missing_counts)
+                + missing_rank
+            )
+            perm = torch.cat([perm, fallback])
+
+        perm = perm[torch.argsort(batch[perm])]
+        x = x[perm]
+        batch = batch[perm]
+        edge_index, edge_attr = subgraph(
+            perm,
+            edge_index,
+            edge_attr=edge_attr,
+            relabel_nodes=True,
+            num_nodes=num_nodes,
+        )
+        return x, edge_index, edge_attr, batch, perm, x.new_ones(x.size(0))
+
+
 class SparsePooling(nn.Module):
     """GCN classifier with two sparse pooling stages."""
 
@@ -82,8 +188,8 @@ class SparsePooling(nn.Module):
     ):
         super().__init__()
 
-        if model not in {"sag", "topk", "ndrp"}:
-            raise ValueError("model must be one of 'sag', 'topk', or 'ndrp'")
+        if model not in {"sag", "topk", "ndrp", "ndp"}:
+            raise ValueError("model must be one of 'sag', 'topk', 'ndrp', or 'ndp'")
 
         self.conv1 = GCNConv(input_dim, hidden)
         self.conv2 = GCNConv(hidden, hidden)
@@ -93,8 +199,10 @@ class SparsePooling(nn.Module):
             pooling_layer = SAGPooling
         elif model == "topk":
             pooling_layer = TopKPooling
-        else:
+        elif model == "ndrp":
             pooling_layer = NDRPPooling
+        else:
+            pooling_layer = NDPPooling
         self.pool1 = pooling_layer(hidden, ratio=pratio)
         self.pool2 = pooling_layer(hidden, ratio=pratio)
 
