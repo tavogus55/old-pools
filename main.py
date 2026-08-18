@@ -3,6 +3,7 @@ from pathlib import Path
 import time
 
 import torch
+from sklearn.metrics import accuracy_score, f1_score
 from torch_geometric.datasets import TUDataset
 from torch_geometric.loader import DataLoader
 
@@ -19,6 +20,46 @@ DENSE_MAX_NODES = {
     "NCI1": 150,
     "NCI109": 150,
 }
+
+
+def evaluate_classification(model, loader, device):
+    model.eval()
+    predictions = []
+    targets = []
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch.to(device)
+            if batch.x is None or batch.x.size(1) == 0:
+                x = torch.ones(
+                    (batch.num_nodes, 1),
+                    dtype=torch.float,
+                    device=batch.edge_index.device,
+                )
+            else:
+                x = batch.x
+
+            output = model(x, batch.edge_index, batch.batch)
+            predictions.append(output.argmax(dim=1).cpu())
+            targets.append(batch.y.view(-1).cpu())
+
+    predictions = torch.cat(predictions).numpy()
+    targets = torch.cat(targets).numpy()
+    return {
+        "accuracy": accuracy_score(targets, predictions),
+        "micro_f1": f1_score(
+            targets,
+            predictions,
+            average="micro",
+            zero_division=0,
+        ),
+        "macro_f1": f1_score(
+            targets,
+            predictions,
+            average="macro",
+            zero_division=0,
+        ),
+    }
 
 
 def main(
@@ -129,6 +170,17 @@ def main(
 
     total_training_time = time.perf_counter() - training_start
     print(f"Total training time for {epochs} epochs: {total_training_time:.2f}s")
+
+    metrics = evaluate_classification(model, loader, device)
+    print(f"Accuracy: {metrics['accuracy']:.4f}")
+    print(f"Micro-F1: {metrics['micro_f1']:.4f}")
+    print(f"Macro-F1: {metrics['macro_f1']:.4f}")
+
+    if device.type == "cuda":
+        reserved_gpu_memory = torch.cuda.memory_reserved(device) / (1024 ** 2)
+        print(f"GPU memory reserved: {reserved_gpu_memory:.2f} MB")
+    else:
+        print("GPU usage: unavailable (running on CPU)")
 
     print(f"Loaded {len(dataset)} graphs from the {dataset_name} TU dataset.")
     print(f"Saved dataset to {output_path}")
