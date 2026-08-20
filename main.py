@@ -9,7 +9,8 @@ import torch
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import KFold
 from torch_geometric.datasets import TUDataset
-from torch_geometric.loader import DataLoader
+from torch_geometric.loader import DataLoader, DenseDataLoader
+from torch_geometric.transforms import ToDense
 
 from pooling_models import DensePool, sparse_pooling
 from utils import get_logger, log_experiment_settings, save_to_csv
@@ -27,7 +28,31 @@ DENSE_MAX_NODES = {
 }
 
 
-def evaluate_classification(model, loader, device):
+def forward_model(model, batch, device, is_dense):
+    """Run a model using either sparse or precomputed dense batch data."""
+    # Dense pooling models use precomputed features, adjacency matrices, and masks.
+    if is_dense:
+        return model(
+            batch.x,
+            adj=batch.adj,
+            mask=batch.mask,
+        )
+
+    # Featureless datasets (IMDB-MULTI, IMDB-BINARY, and COLLAB) receive constant features.
+    if batch.x is None or batch.x.size(1) == 0:
+        x = torch.ones(
+            (batch.num_nodes, 1),
+            dtype=torch.float,
+            device=batch.edge_index.device,
+        )
+    # Feature-aware datasets (PROTEINS, DD, MUTAG, NCI1, and NCI109) use supplied features.
+    else:
+        x = batch.x
+
+    return model(x, batch.edge_index, batch.batch)
+
+
+def evaluate_classification(model, loader, device, is_dense):
     model.eval()
     predictions = []
     targets = []
@@ -35,16 +60,8 @@ def evaluate_classification(model, loader, device):
     with torch.no_grad():
         for batch in loader:
             batch = batch.to(device)
-            if batch.x is None or batch.x.size(1) == 0:
-                x = torch.ones(
-                    (batch.num_nodes, 1),
-                    dtype=torch.float,
-                    device=batch.edge_index.device,
-                )
-            else:
-                x = batch.x
-
-            output = model(x, batch.edge_index, batch.batch)
+            output = forward_model(model, batch, device, is_dense)
+            model.finish_pool_timing()
             predictions.append(output.argmax(dim=1).cpu())
             targets.append(batch.y.view(-1).cpu())
 
@@ -95,7 +112,8 @@ def main(
 
     dataset = TUDataset(root=data_dir, name=dataset_name)
     output_path = data_dir / f"{dataset_name}.pt"
-    torch.save(dataset, output_path)
+    input_dim = max(1, dataset.num_features)
+    num_classes = dataset.num_classes
 
     is_dense = model_name in {
         "diff",
@@ -106,12 +124,29 @@ def main(
         "count2",
         "count4",
     }
-    max_nodes = DENSE_MAX_NODES[dataset_name] if is_dense else None
-    input_dim = max(1, dataset.num_features)
-    num_classes = dataset.num_classes
+    # Apply the same graph-size limit to every model so sparse and dense
+    # methods process exactly the same dataset and cross-validation splits.
+    max_nodes = DENSE_MAX_NODES[dataset_name]
+    original_graph_count = len(dataset)
+    dataset = [data for data in dataset if data.num_nodes <= max_nodes]
+    logger.info(
+        f"Max-node filter: kept {len(dataset)}/{original_graph_count} graphs "
+        f"with at most {max_nodes} nodes"
+    )
 
+    # Save the filtered dataset used by the experiment.
+    torch.save(dataset, output_path)
+    dense_dataset = None
     if is_dense:
-        dataset = [data for data in dataset if data.num_nodes <= max_nodes]
+        # Convert dense inputs once before training instead of rebuilding
+        # padded features and adjacency matrices inside every forward pass.
+        to_dense = ToDense(max_nodes)
+        dense_dataset = []
+        for data in dataset:
+            dense_data = data.clone()
+            if dense_data.x is None or dense_data.x.size(1) == 0:
+                dense_data.x = torch.ones((dense_data.num_nodes, 1))
+            dense_dataset.append(to_dense(dense_data))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
@@ -136,22 +171,39 @@ def main(
     ):
         fold = ((run - 1) % k_folds) + 1
         set_seed(seed)
-        train_val = [dataset[i] for i in train_val_indices]
-        test_dataset = [dataset[i] for i in test_indices]
-        random.shuffle(train_val)
-        validation_size = max(1, int(0.1 * len(train_val)))
-        validation_dataset = train_val[:validation_size]
-        train_dataset = train_val[validation_size:]
+        train_val_indices = list(train_val_indices)
+        random.shuffle(train_val_indices)
+        validation_size = max(1, int(0.1 * len(train_val_indices)))
+        validation_indices = train_val_indices[:validation_size]
+        train_indices = train_val_indices[validation_size:]
 
-        train_loader = DataLoader(
-            train_dataset, batch_size=batch_size, shuffle=True
-        )
-        validation_loader = DataLoader(
-            validation_dataset, batch_size=batch_size, shuffle=False
-        )
-        test_loader = DataLoader(
-            test_dataset, batch_size=batch_size, shuffle=False
-        )
+        train_dataset = [dataset[i] for i in train_indices]
+        validation_dataset = [dataset[i] for i in validation_indices]
+        test_dataset = [dataset[i] for i in test_indices]
+
+        if is_dense:
+            dense_train_dataset = [dense_dataset[i] for i in train_indices]
+            dense_validation_dataset = [dense_dataset[i] for i in validation_indices]
+            dense_test_dataset = [dense_dataset[i] for i in test_indices]
+            train_loader = DenseDataLoader(
+                dense_train_dataset, batch_size=batch_size, shuffle=True
+            )
+            validation_loader = DenseDataLoader(
+                dense_validation_dataset, batch_size=batch_size, shuffle=False
+            )
+            test_loader = DenseDataLoader(
+                dense_test_dataset, batch_size=batch_size, shuffle=False
+            )
+        else:
+            train_loader = DataLoader(
+                train_dataset, batch_size=batch_size, shuffle=True
+            )
+            validation_loader = DataLoader(
+                validation_dataset, batch_size=batch_size, shuffle=False
+            )
+            test_loader = DataLoader(
+                test_dataset, batch_size=batch_size, shuffle=False
+            )
 
         if is_dense:
             model = DensePool(
@@ -201,21 +253,15 @@ def main(
             for batch in train_loader:
                 batch = batch.to(device)
                 optimizer.zero_grad()
-                if batch.x is None or batch.x.size(1) == 0:
-                    x = torch.ones(
-                        (batch.num_nodes, 1),
-                        dtype=torch.float,
-                        device=batch.edge_index.device,
-                    )
-                else:
-                    x = batch.x
-                output = model(x, batch.edge_index, batch.batch)
+                output = forward_model(model, batch, device, is_dense)
                 auxiliary_loss = getattr(model, "last_auxiliary_loss", None)
                 if auxiliary_loss is None:
                     auxiliary_loss = output.new_zeros(())
-                loss = criterion(output, batch.y) + auxiliary_loss
+                target = batch.y.view(-1)
+                loss = criterion(output, target) + auxiliary_loss
                 loss.backward()
                 optimizer.step()
+                model.finish_pool_timing()
                 total_loss += loss.item()
                 total_pool_time += model.last_pool_time
 
@@ -238,9 +284,11 @@ def main(
             )
 
         validation_metrics = evaluate_classification(
-            model, validation_loader, device
+            model, validation_loader, device, is_dense
         )
-        test_metrics = evaluate_classification(model, test_loader, device)
+        test_metrics = evaluate_classification(
+            model, test_loader, device, is_dense
+        )
         fold_metrics.append(test_metrics)
         validation_fold_metrics.append(validation_metrics)
         logger.info(

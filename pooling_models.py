@@ -210,21 +210,41 @@ class SparsePooling(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.classifier = nn.Linear(2 * hidden, num_classes)
         self.last_pool_time = 0.0
+        self._pool_events = []
+        self._pool_cpu_time = 0.0
 
     def _timed_pool(self, pool, x, edge_index, batch):
         if x.is_cuda:
-            torch.cuda.synchronize(x.device)
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            result = pool(x, edge_index, batch=batch)
+            end_event.record()
+            self._pool_events.append((start_event, end_event))
+            return result
+
         pool_start = time.perf_counter()
-
         result = pool(x, edge_index, batch=batch)
-
-        if x.is_cuda:
-            torch.cuda.synchronize(x.device)
-        self.last_pool_time += time.perf_counter() - pool_start
+        self._pool_cpu_time += time.perf_counter() - pool_start
         return result
+
+    def finish_pool_timing(self):
+        """Resolve asynchronous CUDA pool timings once per batch."""
+        if self._pool_events:
+            torch.cuda.synchronize()
+            self.last_pool_time = sum(
+                start.elapsed_time(end) / 1000.0
+                for start, end in self._pool_events
+            )
+            self._pool_events.clear()
+        else:
+            self.last_pool_time = self._pool_cpu_time
+        self._pool_cpu_time = 0.0
 
     def forward(self, x, edge_index, batch):
         self.last_pool_time = 0.0
+        self._pool_events.clear()
+        self._pool_cpu_time = 0.0
 
         # GCNConv: input_dim -> 32
         x = self.conv1(x, edge_index)
@@ -391,37 +411,63 @@ class DensePool(nn.Module):
             )
 
         num_clusters = max(1, int(round(pratio * max_nodes)))
+        second_num_clusters = max(1, int(round(pratio * num_clusters)))
         self.max_nodes = max_nodes
         self.conv1 = DenseGCNConv(input_dim, hidden)
         self.conv2 = DenseGCNConv(hidden, hidden)
         self.conv3 = DenseGCNConv(hidden, hidden)
         self.pool1 = DensePoolingStage(hidden, num_clusters, model, pratio)
-        self.pool2 = DensePoolingStage(hidden, num_clusters, model, pratio)
+        self.pool2 = DensePoolingStage(
+            hidden, second_num_clusters, model, pratio
+        )
         self.dropout = nn.Dropout(dropout)
         self.classifier = nn.Linear(2 * hidden, num_classes)
         self.last_pool_time = 0.0
         self.last_auxiliary_loss = None
+        self._pool_events = []
+        self._pool_cpu_time = 0.0
 
     def _timed_pool(self, pool, x, adj, mask):
         if x.is_cuda:
-            torch.cuda.synchronize(x.device)
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            result = pool(x, adj, mask)
+            end_event.record()
+            self._pool_events.append((start_event, end_event))
+            return result
+
         pool_start = time.perf_counter()
-        x, adj, mask, auxiliary_loss = pool(x, adj, mask)
-        if x.is_cuda:
-            torch.cuda.synchronize(x.device)
-        self.last_pool_time += time.perf_counter() - pool_start
-        return x, adj, mask, auxiliary_loss
+        result = pool(x, adj, mask)
+        self._pool_cpu_time += time.perf_counter() - pool_start
+        return result
 
-    def forward(self, x, edge_index, batch):
+    def finish_pool_timing(self):
+        """Resolve asynchronous CUDA pool timings once per batch."""
+        if self._pool_events:
+            torch.cuda.synchronize()
+            self.last_pool_time = sum(
+                start.elapsed_time(end) / 1000.0
+                for start, end in self._pool_events
+            )
+            self._pool_events.clear()
+        else:
+            self.last_pool_time = self._pool_cpu_time
+        self._pool_cpu_time = 0.0
+
+    def forward(self, x, edge_index=None, batch=None, adj=None, mask=None):
         self.last_pool_time = 0.0
+        self._pool_events.clear()
+        self._pool_cpu_time = 0.0
 
-        # Input preparation: convert sparse graphs to dense padded tensors.
-        x, mask = to_dense_batch(x, batch, max_num_nodes=self.max_nodes)
-        adj = to_dense_adj(
-            edge_index,
-            batch=batch,
-            max_num_nodes=self.max_nodes,
-        )
+        # Input preparation: use precomputed dense tensors when available.
+        if adj is None or mask is None:
+            x, mask = to_dense_batch(x, batch, max_num_nodes=self.max_nodes)
+            adj = to_dense_adj(
+                edge_index,
+                batch=batch,
+                max_num_nodes=self.max_nodes,
+            )
 
         # GCNConv: input_dim -> hidden.
         x = self.conv1(x, adj, mask=mask)
