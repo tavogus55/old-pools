@@ -229,7 +229,7 @@ class SparsePooling(nn.Module):
         return result
 
     def finish_pool_timing(self):
-        """Resolve asynchronous CUDA pool timings once per batch."""
+        """Resolve asynchronous CUDA pool timings for the current window."""
         if self._pool_events:
             torch.cuda.synchronize()
             self.last_pool_time = sum(
@@ -241,11 +241,13 @@ class SparsePooling(nn.Module):
             self.last_pool_time = self._pool_cpu_time
         self._pool_cpu_time = 0.0
 
-    def forward(self, x, edge_index, batch):
-        self.last_pool_time = 0.0
+    def reset_pool_timing(self):
+        """Start a new pooling-timing measurement window."""
         self._pool_events.clear()
         self._pool_cpu_time = 0.0
+        self.last_pool_time = 0.0
 
+    def forward(self, x, edge_index, batch):
         # GCNConv: input_dim -> 32
         x = self.conv1(x, edge_index)
 
@@ -355,34 +357,105 @@ def random_dense_pool(x, adj, pratio, model):
         )
     else:
         q = {"count1": 1, "count2": 2, "count4": 4}[model]
-        if q > num_clusters:
-            raise ValueError(
-                f"CountSketch q={q} cannot exceed {num_clusters} clusters"
-            )
-
-        if q == 1:
-            # Standard CountSketch: one random cluster and sign per node.
-            rows = torch.randint(
-                num_clusters,
-                (batch_size, num_nodes, 1),
-                device=x.device,
-            )
-            signs = x.new_empty(batch_size, num_nodes, 1).random_(2).mul_(2).sub_(1)
-        else:
-            # Select q distinct clusters per node and assign Rademacher signs.
-            rows = torch.rand(
-                batch_size, num_nodes, num_clusters, device=x.device
-            ).topk(q, dim=2, sorted=False).indices
-            scale = q ** -0.5
-            signs = x.new_empty(batch_size, num_nodes, q).random_(2)
-            signs = signs.mul_(2 * scale).sub_(scale)
-
-        st = x.new_zeros(batch_size, num_nodes, num_clusters)
-        st.scatter_(2, rows, signs)
+        return countsketch_dense_pool(x, adj, num_clusters, q)
 
     s = st.transpose(1, 2)
     ast = torch.bmm(adj, st)
     return torch.bmm(s, x), torch.bmm(s, ast)
+
+
+def countsketch_dense_pool(x, adj, num_clusters, q):
+    """Batched version of the original CountSketch pooling function.
+
+    The original function constructs a sketch matrix ``S`` and returns::
+
+        X' = S @ X
+        A' = S @ A @ S.T
+
+    This implementation performs the same two mathematical operations, but
+    stores only the non-zero cluster assignments and signs.  The change is
+    needed because the dense ``S`` matrix contains mostly zeros for Count1,
+    Count2, and Count4.  The input is also batched, so tensors have a leading
+    batch dimension that is absent from the original single-graph function.
+    """
+    batch_size, num_nodes, feature_dim = x.shape
+    if q > num_clusters:
+        raise ValueError(
+            f"CountSketch q={q} cannot exceed {num_clusters} clusters"
+        )
+
+    # Original code: choose q cluster locations for every node before building S.T.
+    # New code: store those locations directly instead of constructing dense S.T.
+    rows = torch.randint(
+        num_clusters,
+        (batch_size, num_nodes, q),
+        device=x.device,
+    )
+
+    # Original q>1 code uses topk to sample q distinct locations without replacement.
+    # Resampling only duplicates preserves that same distinct-assignment requirement.
+    for assignment in range(1, q):
+        duplicate = (
+            rows[:, :, assignment, None] == rows[:, :, :assignment]
+        ).any(dim=-1)
+        while duplicate.any():
+            replacement = torch.randint(
+                num_clusters,
+                duplicate.shape,
+                device=x.device,
+            )
+            rows[:, :, assignment] = torch.where(
+                duplicate,
+                replacement,
+                rows[:, :, assignment],
+            )
+            duplicate = (
+                rows[:, :, assignment, None] == rows[:, :, :assignment]
+            ).any(dim=-1)
+
+    # Original code: assign independent Rademacher signs to the non-zero entries of S.
+    # The signs are stored directly because S itself is no longer materialized.
+    scale = q ** -0.5
+    signs = x.new_empty(batch_size, num_nodes, q).random_(2)
+    signs = signs.mul_(2 * scale).sub_(scale)
+
+    # The original function handles one graph, while this model handles B graphs.
+    # Offsets keep cluster IDs from different graphs independent during batching.
+    graph_offsets = (
+        torch.arange(batch_size, device=x.device).view(batch_size, 1, 1)
+        * num_clusters
+    )
+    flat_clusters = (rows + graph_offsets).reshape(-1)
+
+    # Original step: X' = S @ X.
+    # Equivalent batched step: add each signed node feature to its assigned cluster.
+    pooled_x = x.new_zeros(batch_size * num_clusters, feature_dim)
+    signed_x = (x.unsqueeze(2) * signs.unsqueeze(-1)).reshape(-1, feature_dim)
+    pooled_x.index_add_(0, flat_clusters, signed_x)
+    pooled_x = pooled_x.view(batch_size, num_clusters, feature_dim)
+
+    # Original first adjacency step: compute S @ A.
+    # Each signed adjacency row is accumulated into its assigned cluster.
+    pooled_left = x.new_zeros(batch_size * num_clusters, num_nodes)
+    for assignment in range(q):
+        cluster_ids = (
+            rows[:, :, assignment] + graph_offsets[:, :, 0]
+        ).reshape(-1)
+        signed_rows = adj * signs[:, :, assignment].unsqueeze(-1)
+        pooled_left.index_add_(0, cluster_ids, signed_rows.reshape(-1, num_nodes))
+    pooled_left = pooled_left.view(batch_size, num_clusters, num_nodes)
+
+    # Original second adjacency step: compute (S @ A) @ S.T.
+    # Scatter-add performs the same column assignment without constructing S.T.
+    pooled_adj = x.new_zeros(batch_size, num_clusters, num_clusters)
+    for assignment in range(q):
+        values = pooled_left * signs[:, :, assignment].unsqueeze(1)
+        target_clusters = rows[:, :, assignment].unsqueeze(1).expand(
+            batch_size, num_clusters, num_nodes
+        )
+        pooled_adj.scatter_add_(2, target_clusters, values)
+
+    return pooled_x, pooled_adj
 
 
 class DensePool(nn.Module):
@@ -443,7 +516,7 @@ class DensePool(nn.Module):
         return result
 
     def finish_pool_timing(self):
-        """Resolve asynchronous CUDA pool timings once per batch."""
+        """Resolve asynchronous CUDA pool timings for the current window."""
         if self._pool_events:
             torch.cuda.synchronize()
             self.last_pool_time = sum(
@@ -455,11 +528,13 @@ class DensePool(nn.Module):
             self.last_pool_time = self._pool_cpu_time
         self._pool_cpu_time = 0.0
 
-    def forward(self, x, edge_index=None, batch=None, adj=None, mask=None):
-        self.last_pool_time = 0.0
+    def reset_pool_timing(self):
+        """Start a new pooling-timing measurement window."""
         self._pool_events.clear()
         self._pool_cpu_time = 0.0
+        self.last_pool_time = 0.0
 
+    def forward(self, x, edge_index=None, batch=None, adj=None, mask=None):
         # Input preparation: use precomputed dense tensors when available.
         if adj is None or mask is None:
             x, mask = to_dense_batch(x, batch, max_num_nodes=self.max_nodes)
