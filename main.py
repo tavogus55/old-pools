@@ -12,7 +12,7 @@ from torch_geometric.datasets import TUDataset
 from torch_geometric.loader import DataLoader, DenseDataLoader
 from torch_geometric.transforms import ToDense
 
-from pooling_models import DensePool, sparse_pooling
+from pooling_models import DensePool, SparseRandomPooling, sparse_pooling
 from utils import get_logger, log_experiment_settings, save_to_csv
 
 
@@ -126,15 +126,9 @@ def main(
     input_dim = max(1, dataset.num_features)
     num_classes = dataset.num_classes
 
-    is_dense = model_name in {
-        "diff",
-        "mincut",
-        "gaus",
-        "unif",
-        "count1",
-        "count2",
-        "count4",
-    }
+    # DiffPool and MinCutPool use PyG's dense assignment operators.  The
+    # random clustering methods use the sparse graph implementation instead.
+    is_dense = model_name in {"diff", "mincut"}
     # Apply the same graph-size limit to every model so sparse and dense
     # methods process exactly the same dataset and cross-validation splits.
     max_nodes = DENSE_MAX_NODES[dataset_name]
@@ -243,6 +237,15 @@ def main(
                 pratio=pratio,
                 dropout=dropout,
                 max_nodes=max_nodes,
+            ).to(device)
+        elif model_name in {"gaus", "unif", "count1", "count2", "count4"}:
+            model = SparseRandomPooling(
+                input_dim,
+                num_classes,
+                model=model_name,
+                hidden=hidden,
+                pratio=pratio,
+                dropout=dropout,
             ).to(device)
         else:
             model = sparse_pooling(

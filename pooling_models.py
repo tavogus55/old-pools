@@ -298,6 +298,283 @@ class SparsePooling(nn.Module):
         return self.classifier(graph_representation)
 
 
+class SparseRandomClusterPool(nn.Module):
+    """Random clustering pool that consumes and returns sparse graph edges.
+
+    Gaussian and uniform clustering use a dense assignment for each graph,
+    but keep the original adjacency sparse while computing ``S @ A @ S.T``.
+    CountSketch uses an implicit sparse assignment and aggregates edges
+    directly, avoiding a dense assignment matrix altogether.
+    """
+
+    def __init__(self, model: str, ratio: float):
+        super().__init__()
+        if model not in {"gaus", "unif", "count1", "count2", "count4"}:
+            raise ValueError("Unsupported sparse random clustering model")
+        self.model = model
+        self.ratio = ratio
+        self.q = {"count1": 1, "count2": 2, "count4": 4}.get(model)
+
+    def _count_graph(self, x, edge_index, edge_weight, num_clusters):
+        num_nodes = x.size(0)
+        if self.q > num_clusters:
+            raise ValueError(
+                f"CountSketch q={self.q} cannot exceed {num_clusters} clusters"
+            )
+
+        # Original step: choose q distinct cluster locations for every node.
+        # Sparse implementation: store only those q locations instead of S.
+        rows = torch.randint(
+            num_clusters, (num_nodes, self.q), device=x.device
+        )
+        for assignment in range(1, self.q):
+            duplicate = (
+                rows[:, assignment, None] == rows[:, :assignment]
+            ).any(dim=1)
+            while duplicate.any():
+                replacement = torch.randint(
+                    num_clusters, (int(duplicate.sum()),), device=x.device
+                )
+                rows[duplicate, assignment] = replacement
+                duplicate = (
+                    rows[:, assignment, None] == rows[:, :assignment]
+                ).any(dim=1)
+
+        # Original step: generate scaled Rademacher signs for non-zero S entries.
+        scale = self.q ** -0.5
+        signs = x.new_empty(num_nodes, self.q).random_(2)
+        signs = signs.mul_(2 * scale).sub_(scale)
+
+        # Original step: X' = S @ X, accumulated only at non-zero assignments.
+        pooled_x = x.new_zeros(num_clusters, x.size(1))
+        pooled_x.index_add_(
+            0,
+            rows.reshape(-1),
+            (x.unsqueeze(1) * signs.unsqueeze(-1)).reshape(-1, x.size(1)),
+        )
+
+        # Original step: A' = S @ A @ S.T, with each edge expanded to q^2
+        # assignment pairs.  Coalescing combines duplicate pooled edges.
+        if edge_index.numel() == 0:
+            pooled_edge_index = edge_index.new_empty((2, 0))
+            pooled_edge_weight = x.new_empty(0)
+        else:
+            source, target = edge_index
+            if edge_weight is None:
+                edge_weight = x.new_ones(source.size(0))
+            pooled_rows = []
+            pooled_cols = []
+            pooled_weights = []
+            for source_assignment in range(self.q):
+                for target_assignment in range(self.q):
+                    pooled_rows.append(rows[source, source_assignment])
+                    pooled_cols.append(rows[target, target_assignment])
+                    pooled_weights.append(
+                        edge_weight
+                        * signs[source, source_assignment]
+                        * signs[target, target_assignment]
+                    )
+            pooled_edge_index = torch.stack(
+                [torch.cat(pooled_rows), torch.cat(pooled_cols)], dim=0
+            )
+            pooled_edge_weight = torch.cat(pooled_weights)
+            pooled = torch.sparse_coo_tensor(
+                pooled_edge_index,
+                pooled_edge_weight,
+                (num_clusters, num_clusters),
+                device=x.device,
+            ).coalesce()
+            pooled_edge_index = pooled.indices()
+            pooled_edge_weight = pooled.values()
+
+        pooled_batch = x.new_zeros(num_clusters, dtype=torch.long)
+        return (
+            pooled_x,
+            pooled_edge_index,
+            pooled_edge_weight,
+            pooled_batch,
+        )
+
+    def _dense_assignment_graph(
+        self, x, edge_index, edge_weight, num_clusters
+    ):
+        num_nodes = x.size(0)
+
+        # Gaussian/uniform methods retain their mathematically dense S matrix.
+        if self.model == "gaus":
+            st = x.new_empty(num_nodes, num_clusters).normal_(
+                0.0, num_clusters ** -0.5
+            )
+        else:
+            bound = (3.0 / num_clusters) ** 0.5
+            st = x.new_empty(num_nodes, num_clusters).uniform_(-bound, bound)
+        s = st.t()
+
+        # Keep A sparse for the first multiplication instead of constructing
+        # an n-by-n dense adjacency matrix.
+        if edge_weight is None:
+            edge_weight = x.new_ones(edge_index.size(1))
+        sparse_adj = torch.sparse_coo_tensor(
+            edge_index,
+            edge_weight,
+            (num_nodes, num_nodes),
+            device=x.device,
+        ).coalesce()
+        ast = torch.sparse.mm(sparse_adj, st)
+
+        # S @ A @ S.T can naturally densify after clustering; convert only the
+        # pooled result to sparse edge form for the next GCN layer.
+        pooled_x = s @ x
+        pooled_adj = s @ ast
+        pooled_edge_index = pooled_adj.nonzero(as_tuple=False).t().contiguous()
+        pooled_edge_weight = pooled_adj[pooled_edge_index[0], pooled_edge_index[1]]
+        pooled_batch = x.new_zeros(num_clusters, dtype=torch.long)
+        return (
+            pooled_x,
+            pooled_edge_index,
+            pooled_edge_weight,
+            pooled_batch,
+        )
+
+    def forward(self, x, edge_index, edge_weight=None, batch=None):
+        if batch is None:
+            batch = x.new_zeros(x.size(0), dtype=torch.long)
+
+        graph_count = int(batch.max().item()) + 1 if batch.numel() else 0
+        outputs = []
+        cluster_offset = 0
+        for graph_id in range(graph_count):
+            node_ids = (batch == graph_id).nonzero(as_tuple=False).view(-1)
+            num_nodes = node_ids.numel()
+            num_clusters = max(1, int(round(self.ratio * num_nodes)))
+            node_start = node_ids[0]
+            node_end = node_ids[-1] + 1
+            edge_mask = (edge_index[0] >= node_start) & (edge_index[0] < node_end)
+            local_edges = edge_index[:, edge_mask] - node_start
+            local_weights = None if edge_weight is None else edge_weight[edge_mask]
+            local_x = x[node_ids]
+
+            if self.q is None:
+                result = self._dense_assignment_graph(
+                    local_x, local_edges, local_weights, num_clusters
+                )
+            else:
+                result = self._count_graph(
+                    local_x, local_edges, local_weights, num_clusters
+                )
+            pooled_x, pooled_edges, pooled_weights, _ = result
+            outputs.append(
+                (pooled_x, pooled_edges + cluster_offset, pooled_weights, graph_id)
+            )
+            cluster_offset += num_clusters
+
+        pooled_x = torch.cat([item[0] for item in outputs], dim=0)
+        pooled_edges = torch.cat([item[1] for item in outputs], dim=1)
+        pooled_weights = torch.cat([item[2] for item in outputs], dim=0)
+        pooled_batch = torch.cat([
+            pooled_x.new_full((item[0].size(0),), item[3], dtype=torch.long)
+            for item in outputs
+        ])
+        return pooled_x, pooled_edges, pooled_weights, pooled_batch
+
+
+class SparseRandomPooling(nn.Module):
+    """Same three-GCN architecture using sparse random clustering stages."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        num_classes: int,
+        model: str,
+        hidden: int = 32,
+        pratio: float = 0.5,
+        dropout: float = 0.2,
+    ):
+        super().__init__()
+        self.conv1 = GCNConv(input_dim, hidden)
+        self.conv2 = GCNConv(hidden, hidden)
+        self.conv3 = GCNConv(hidden, hidden)
+        self.pool1 = SparseRandomClusterPool(model, pratio)
+        self.pool2 = SparseRandomClusterPool(model, pratio)
+        self.dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(2 * hidden, num_classes)
+        self.last_pool_time = 0.0
+        self.last_auxiliary_loss = None
+        self._pool_events = []
+        self._pool_cpu_time = 0.0
+
+    def _timed_pool(self, pool, x, edge_index, edge_weight, batch):
+        if x.is_cuda:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            result = pool(x, edge_index, edge_weight, batch)
+            end_event.record()
+            self._pool_events.append((start_event, end_event))
+            return result
+        pool_start = time.perf_counter()
+        result = pool(x, edge_index, edge_weight, batch)
+        self._pool_cpu_time += time.perf_counter() - pool_start
+        return result
+
+    def finish_pool_timing(self):
+        if self._pool_events:
+            torch.cuda.synchronize()
+            self.last_pool_time = sum(
+                start.elapsed_time(end) / 1000.0
+                for start, end in self._pool_events
+            )
+            self._pool_events.clear()
+        else:
+            self.last_pool_time = self._pool_cpu_time
+        self._pool_cpu_time = 0.0
+
+    def reset_pool_timing(self):
+        self._pool_events.clear()
+        self._pool_cpu_time = 0.0
+        self.last_pool_time = 0.0
+
+    def forward(self, x, edge_index, batch):
+        edge_weight = None
+
+        # GCNConv: input_dim -> hidden.
+        x = self.conv1(x, edge_index, edge_weight)
+        # ReLU.
+        x = x.relu()
+        # Dropout.
+        x = self.dropout(x)
+        # Pooling: ratio = pratio.
+        x, edge_index, edge_weight, batch = self._timed_pool(
+            self.pool1, x, edge_index, edge_weight, batch
+        )
+
+        # GCNConv: hidden -> hidden.
+        x = self.conv2(x, edge_index, edge_weight)
+        # ReLU.
+        x = x.relu()
+        # Dropout.
+        x = self.dropout(x)
+        # Pooling: ratio = pratio.
+        x, edge_index, edge_weight, batch = self._timed_pool(
+            self.pool2, x, edge_index, edge_weight, batch
+        )
+
+        # GCNConv: hidden -> hidden.
+        x = self.conv3(x, edge_index, edge_weight)
+        # ReLU.
+        x = x.relu()
+        # Dropout.
+        x = self.dropout(x)
+        # Readout: element-wise mean.
+        mean = global_mean_pool(x, batch)
+        # Readout: element-wise max.
+        maximum = global_max_pool(x, batch)
+        # 64-dimensional graph representation.
+        graph_representation = torch.cat([mean, maximum], dim=1)
+        # Linear output layer.
+        return self.classifier(graph_representation)
+
+
 sparse_pooling = SparsePooling
 
 
