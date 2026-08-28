@@ -12,7 +12,7 @@ from torch_geometric.datasets import TUDataset
 from torch_geometric.loader import DataLoader, DenseDataLoader
 from torch_geometric.transforms import ToDense
 
-from pooling_models import DensePool, sparse_pooling
+from pooling_models import CountSketchPooling, DensePool, sparse_pooling
 from utils import get_logger, log_experiment_settings, save_to_csv
 
 
@@ -48,6 +48,19 @@ def forward_model(model, batch, device, is_dense):
     # Feature-aware datasets (PROTEINS, DD, MUTAG, NCI1, and NCI109) use supplied features.
     else:
         x = batch.x
+
+    # CountSketch accepts optional scalar edge weights; multidimensional TU
+    # edge attributes are not valid scalar weights and therefore default to 1.
+    if isinstance(model, CountSketchPooling):
+        edge_weight = getattr(batch, "edge_attr", None)
+        if edge_weight is not None and edge_weight.dim() != 1:
+            edge_weight = None
+        return model(
+            x,
+            batch.edge_index,
+            batch.batch,
+            edge_weight=edge_weight,
+        )
 
     return model(x, batch.edge_index, batch.batch)
 
@@ -111,6 +124,7 @@ def main(
     weight_decay: float,
     dropout: float,
     batch_size: int,
+    mp_layer: str,
     k_folds: int,
     seeds,
     logger,
@@ -131,9 +145,6 @@ def main(
         "mincut",
         "gaus",
         "unif",
-        "count1",
-        "count2",
-        "count4",
     }
     # Apply the same graph-size limit to every model so sparse and dense
     # methods process exactly the same dataset and cross-validation splits.
@@ -244,6 +255,16 @@ def main(
                 dropout=dropout,
                 max_nodes=max_nodes,
             ).to(device)
+        elif model_name in {"count1", "count2", "count4"}:
+            model = CountSketchPooling(
+                input_dim,
+                num_classes,
+                q=int(model_name.removeprefix("count")),
+                hidden=hidden,
+                pratio=pratio,
+                dropout=dropout,
+                mp_layer=mp_layer,
+            ).to(device)
         else:
             model = sparse_pooling(
                 input_dim,
@@ -252,6 +273,7 @@ def main(
                 hidden=hidden,
                 pratio=pratio,
                 dropout=dropout,
+                mp_layer=mp_layer,
             ).to(device)
 
         optimizer = torch.optim.Adam(
@@ -489,6 +511,12 @@ if __name__ == "__main__":
         help="Training batch size.",
     )
     parser.add_argument(
+        "--mp-layer",
+        choices=("gcn", "graphconv"),
+        default="graphconv",
+        help="Sparse message-passing layer used by all sparse models.",
+    )
+    parser.add_argument(
         "--k_folds",
         "--k-folds",
         dest="k_folds",
@@ -546,6 +574,7 @@ if __name__ == "__main__":
         args.weight_decay,
         args.dropout,
         args.batch_size,
+        args.mp_layer,
         args.k_folds,
         args.seeds,
         logger,

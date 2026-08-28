@@ -5,6 +5,7 @@ from torch import nn
 from torch_geometric.nn import (
     DenseGCNConv,
     GCNConv,
+    GraphConv,
     SAGPooling,
     TopKPooling,
     global_max_pool,
@@ -14,6 +15,15 @@ from torch_geometric.nn import (
 )
 from torch_geometric.utils import subgraph, to_dense_adj, to_dense_batch
 from torch_scatter import scatter_add, scatter_max, scatter_min
+
+
+def make_message_passing_layer(mp_layer, input_dim, output_dim):
+    """Create the selected sparse message-passing layer."""
+    if mp_layer == "gcn":
+        return GCNConv(input_dim, output_dim)
+    if mp_layer == "graphconv":
+        return GraphConv(input_dim, output_dim)
+    raise ValueError("mp_layer must be 'gcn' or 'graphconv'")
 
 
 def batched_random_topk(batch, ratio):
@@ -39,6 +49,107 @@ def batched_random_topk(batch, ratio):
     ) - graph_offsets[sorted_batch]
     selected = node_positions < keep[sorted_batch]
     return perm[selected]
+
+
+def sample_countsketch_rows(p_node, q):
+    """Sample distinct local CountSketch buckets without an N-by-P tensor."""
+    q_node = p_node.clamp(max=q)
+    n = p_node.numel()
+    rows = torch.zeros((n, q), dtype=torch.long, device=p_node.device)
+    valid = torch.arange(q, device=p_node.device)[None, :] < q_node[:, None]
+
+    # Vectorized Floyd sampling; q is only 1, 2, or 4 in this experiment.
+    for k in range(q):
+        upper = p_node - q_node + k
+        candidate = (torch.rand(n, device=p_node.device) * (upper + 1)).long()
+        if k:
+            duplicate = (candidate[:, None] == rows[:, :k]).any(dim=1)
+            candidate = torch.where(duplicate, upper, candidate)
+        rows[:, k] = torch.where(valid[:, k], candidate, 0)
+
+    return rows, valid, q_node
+
+
+def countsketch_pool(
+    x, edge_index, pr, q, batch=None, edge_weight=None
+):
+    """Sparse CountSketch pooling for a PyG graph or mini-batch.
+
+    This implements the same mathematical operations as the original dense
+    version, X_pool = S X and A_pool = S A S.T, but never materializes S.
+    Only the non-zero assignment locations are sampled and stored.
+    """
+    if x.dim() != 2 or edge_index.dim() != 2 or edge_index.size(0) != 2:
+        raise ValueError("x must be [N,d] and edge_index must be [2,E]")
+    if not 0.0 < pr <= 1.0 or not isinstance(q, int) or q < 1:
+        raise ValueError("require 0 < pr <= 1 and integer q >= 1")
+
+    n, feature_dim = x.shape
+    if n == 0:
+        raise ValueError("x must contain at least one node")
+    if batch is None:
+        batch = torch.zeros(n, dtype=torch.long, device=x.device)
+    if batch.numel() != n:
+        raise ValueError("batch must contain one graph id per node")
+
+    num_graphs = int(batch.max().item()) + 1
+    num_nodes_per_graph = torch.bincount(batch, minlength=num_graphs)
+    num_clusters_per_graph = (num_nodes_per_graph * pr).long().clamp_min(1)
+    pool_ptr = torch.cat(
+        (num_clusters_per_graph.new_zeros(1), num_clusters_per_graph.cumsum(0))
+    )
+    total_clusters = int(pool_ptr[-1].item())
+
+    # Sample graph-local buckets and offset them into the batched cluster space.
+    p_node = num_clusters_per_graph[batch]
+    rows, valid, q_node = sample_countsketch_rows(p_node, q)
+    rows = rows + pool_ptr[batch][:, None]
+
+    # Generate the same scaled Rademacher signs used by CountSketch.
+    signs = x.new_empty((n, q)).random_(2).mul_(2).sub_(1)
+    signs *= valid / q_node.to(x.dtype).sqrt()[:, None]
+
+    # Original operation: X_pool = S X, using only non-zero assignments.
+    pooled_x = x.new_zeros((total_clusters, feature_dim))
+    for assignment in range(q):
+        keep = valid[:, assignment]
+        pooled_x = pooled_x.index_add(
+            0,
+            rows[keep, assignment],
+            signs[keep, assignment, None] * x[keep],
+        )
+
+    src, dst = edge_index
+    if edge_weight is None:
+        edge_weight = x.new_ones(src.numel())
+    if edge_weight.dim() != 1 or edge_weight.numel() != src.numel():
+        raise ValueError("edge_weight must be a scalar vector of length E")
+
+    # Original operation: A_pool = S A S.T. Each edge produces at most q^2
+    # pooled-edge events, which are combined by sparse COO coalescing.
+    pair = valid[src, :, None] & valid[dst, None, :]
+    out_src = rows[src, :, None].expand(-1, q, q)[pair]
+    out_dst = rows[dst, None, :].expand(-1, q, q)[pair]
+    out_weight = (
+        edge_weight[:, None, None]
+        * signs[src, :, None]
+        * signs[dst, None, :]
+    )[pair]
+
+    pooled_adjacency = torch.sparse_coo_tensor(
+        torch.stack((out_src, out_dst)),
+        out_weight,
+        (total_clusters, total_clusters),
+        device=x.device,
+    ).coalesce()
+    nonzero = pooled_adjacency.values() != 0
+    pooled_edge_index = pooled_adjacency.indices()[:, nonzero]
+    pooled_edge_weight = pooled_adjacency.values()[nonzero]
+    pooled_batch = torch.repeat_interleave(
+        torch.arange(num_graphs, device=x.device), num_clusters_per_graph
+    )
+
+    return pooled_x, pooled_edge_index, pooled_edge_weight, pooled_batch
 
 
 def maximal_independent_set(edge_index, num_nodes=None):
@@ -185,15 +296,16 @@ class SparsePooling(nn.Module):
         hidden: int = 32,
         pratio: float = 0.5,
         dropout: float = 0.5,
+        mp_layer: str = "graphconv",
     ):
         super().__init__()
 
         if model not in {"sag", "topk", "ndrp", "ndp"}:
             raise ValueError("model must be one of 'sag', 'topk', 'ndrp', or 'ndp'")
 
-        self.conv1 = GCNConv(input_dim, hidden)
-        self.conv2 = GCNConv(hidden, hidden)
-        self.conv3 = GCNConv(hidden, hidden)
+        self.conv1 = make_message_passing_layer(mp_layer, input_dim, hidden)
+        self.conv2 = make_message_passing_layer(mp_layer, hidden, hidden)
+        self.conv3 = make_message_passing_layer(mp_layer, hidden, hidden)
 
         if model == "sag":
             pooling_layer = SAGPooling
@@ -207,6 +319,7 @@ class SparsePooling(nn.Module):
         self.pool2 = pooling_layer(hidden, ratio=pratio)
 
         self.model = model
+        self.mp_layer = mp_layer
         self.dropout = nn.Dropout(dropout)
         self.classifier = nn.Linear(2 * hidden, num_classes)
         self.last_pool_time = 0.0
@@ -299,6 +412,122 @@ class SparsePooling(nn.Module):
 
 
 sparse_pooling = SparsePooling
+
+
+class CountSketchPooling(nn.Module):
+    """Three-GCN classifier using sparse CountSketch pooling stages."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        num_classes: int,
+        q: int,
+        hidden: int = 32,
+        pratio: float = 0.5,
+        dropout: float = 0.2,
+        mp_layer: str = "graphconv",
+    ):
+        super().__init__()
+        if q not in {1, 2, 4}:
+            raise ValueError("CountSketch q must be 1, 2, or 4")
+
+        self.q = q
+        self.pratio = pratio
+        self.mp_layer = mp_layer
+        self.conv1 = make_message_passing_layer(mp_layer, input_dim, hidden)
+        self.conv2 = make_message_passing_layer(mp_layer, hidden, hidden)
+        self.conv3 = make_message_passing_layer(mp_layer, hidden, hidden)
+        self.dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(2 * hidden, num_classes)
+        self.last_pool_time = 0.0
+        self._pool_events = []
+        self._pool_cpu_time = 0.0
+
+    def _timed_pool(self, x, edge_index, edge_weight, batch):
+        if x.is_cuda:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            result = countsketch_pool(
+                x,
+                edge_index,
+                self.pratio,
+                self.q,
+                batch=batch,
+                edge_weight=edge_weight,
+            )
+            end_event.record()
+            self._pool_events.append((start_event, end_event))
+            return result
+
+        pool_start = time.perf_counter()
+        result = countsketch_pool(
+            x,
+            edge_index,
+            self.pratio,
+            self.q,
+            batch=batch,
+            edge_weight=edge_weight,
+        )
+        self._pool_cpu_time += time.perf_counter() - pool_start
+        return result
+
+    def finish_pool_timing(self):
+        """Resolve asynchronous CUDA pool timings for the current window."""
+        if self._pool_events:
+            torch.cuda.synchronize()
+            self.last_pool_time = sum(
+                start.elapsed_time(end) / 1000.0
+                for start, end in self._pool_events
+            )
+            self._pool_events.clear()
+        else:
+            self.last_pool_time = self._pool_cpu_time
+        self._pool_cpu_time = 0.0
+
+    def reset_pool_timing(self):
+        """Start a new pooling-timing measurement window."""
+        self._pool_events.clear()
+        self._pool_cpu_time = 0.0
+        self.last_pool_time = 0.0
+
+    def forward(self, x, edge_index, batch, edge_weight=None):
+        # Selected message-passing layer: input_dim -> hidden.
+        x = self.conv1(x, edge_index, edge_weight)
+        # ReLU.
+        x = x.relu()
+        # Dropout.
+        x = self.dropout(x)
+        # Pooling: ratio = pratio.
+        x, edge_index, edge_weight, batch = self._timed_pool(
+            x, edge_index, edge_weight, batch
+        )
+
+        # Selected message-passing layer: hidden -> hidden.
+        x = self.conv2(x, edge_index, edge_weight)
+        # ReLU.
+        x = x.relu()
+        # Dropout.
+        x = self.dropout(x)
+        # Pooling: ratio = pratio.
+        x, edge_index, edge_weight, batch = self._timed_pool(
+            x, edge_index, edge_weight, batch
+        )
+
+        # Selected message-passing layer: hidden -> hidden.
+        x = self.conv3(x, edge_index, edge_weight)
+        # ReLU.
+        x = x.relu()
+        # Dropout.
+        x = self.dropout(x)
+        # Readout: element-wise mean.
+        mean = global_mean_pool(x, batch)
+        # Readout: element-wise max.
+        maximum = global_max_pool(x, batch)
+        # 2 * hidden-dimensional graph representation.
+        graph_representation = torch.cat([mean, maximum], dim=1)
+        # Linear output layer.
+        return self.classifier(graph_representation)
 
 
 class DensePoolingStage(nn.Module):

@@ -131,6 +131,7 @@ def save_to_csv(
         "hidden": args.hidden,
         "dropout": args.dropout,
         "batch_size": args.batch_size,
+        "mp_layer": args.mp_layer,
         "max_nodes": max_nodes,
         "k_folds": args.k_folds,
         "pool_ratio": args.pratio,
