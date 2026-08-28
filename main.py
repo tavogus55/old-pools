@@ -145,6 +145,9 @@ def main(
         "mincut",
         "gaus",
         "unif",
+        "dmon",
+        "hosc",
+        "justb",
     }
     # Apply the same graph-size limit to every model so sparse and dense
     # methods process exactly the same dataset and cross-validation splits.
@@ -303,11 +306,11 @@ def main(
                 batch = batch.to(device)
                 optimizer.zero_grad()
                 output = forward_model(model, batch, device, is_dense)
-                auxiliary_loss = getattr(model, "last_auxiliary_loss", None)
-                if auxiliary_loss is None:
-                    auxiliary_loss = output.new_zeros(())
                 target = batch.y.view(-1)
-                loss = criterion(output, target) + auxiliary_loss
+                # Match the benchmark paper: optimize classification loss only.
+                # Pooling auxiliary objectives remain available on the model for
+                # diagnostics but are not added to the training objective.
+                loss = criterion(output, target)
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
@@ -453,8 +456,21 @@ if __name__ == "__main__":
             "topk",
             "ndrp",
             "ndp",
+            "graclus",
+            "asapool",
+            "pan",
+            "cop",
+            "cgi",
+            "kmis",
+            "gsap",
+            "hgpsl",
+            "hdpsl",
+            "pars",
             "diff",
             "mincut",
+            "dmon",
+            "hosc",
+            "justb",
             "gaus",
             "unif",
             "count1",
