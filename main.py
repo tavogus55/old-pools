@@ -8,10 +8,11 @@ from datetime import datetime
 import torch
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import KFold
-from torch_geometric.datasets import TUDataset
+from torch_geometric.datasets import MoleculeNet, TUDataset
 from torch_geometric.loader import DataLoader, DenseDataLoader
 from torch_geometric.transforms import ToDense
 
+from dataset_loader import CSVMoleculeDataset
 from pooling_models import CountSketchPooling, DensePool, sparse_pooling
 from utils import get_logger, log_experiment_settings, save_to_csv
 
@@ -25,7 +26,15 @@ DENSE_MAX_NODES = {
     "COLLAB": 150,
     "NCI1": 150,
     "NCI109": 150,
+    "ESOL": 64,
+    "FreeSolv": 32,
+    "lipo": 128,
+    "QM7": 32,
+    "QM8": 32,
+    "BACE": 96,
 }
+
+REGRESSION_DATASETS = {"QM7", "QM8", "BACE", "ESOL", "FreeSolv", "lipo"}
 
 
 def forward_model(model, batch, device, is_dense):
@@ -47,7 +56,9 @@ def forward_model(model, batch, device, is_dense):
         )
     # Feature-aware datasets (PROTEINS, DD, MUTAG, NCI1, and NCI109) use supplied features.
     else:
-        x = batch.x
+        # MoleculeNet atom features may be stored as integer tensors, while
+        # all message-passing layers operate on floating-point features.
+        x = batch.x.float()
 
     # CountSketch accepts optional scalar edge weights; multidimensional TU
     # edge attributes are not valid scalar weights and therefore default to 1.
@@ -114,6 +125,44 @@ def synchronized_time(device):
     return time.perf_counter()
 
 
+def evaluate_regression(model, loader, device, is_dense, target_mean, target_std):
+    """Evaluate regression predictions after returning them to target units."""
+    model.eval()
+    model.reset_pool_timing()
+    predictions = []
+    targets = []
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch.to(device)
+            output = forward_model(model, batch, device, is_dense)
+            target = batch.y.float()
+            output = output * target_std + target_mean
+            predictions.append(output.view(-1).cpu())
+            targets.append(target.view(-1).cpu())
+
+    model.finish_pool_timing()
+    predictions = torch.cat(predictions)
+    targets = torch.cat(targets)
+    error = predictions - targets
+    mse = torch.mean(error.pow(2)).item()
+    return {
+        "mse": mse,
+        "rmse": mse ** 0.5,
+        "mae": torch.mean(error.abs()).item(),
+    }
+
+
+def normalize_regression_dataset(dataset, mean, std):
+    """Clone graphs and normalize only their regression targets."""
+    normalized = []
+    for data in dataset:
+        item = data.clone()
+        item.y = (item.y.float() - mean) / std
+        normalized.append(item)
+    return normalized
+
+
 def main(
     dataset_name: str,
     model_name: str,
@@ -135,10 +184,22 @@ def main(
     data_dir = project_dir / "data"
 
     preprocessing_start = time.perf_counter()
-    dataset = TUDataset(root=data_dir, name=dataset_name)
+    task_type = "regression" if dataset_name in REGRESSION_DATASETS else "multiclass"
+    if dataset_name in {"QM7", "QM8", "BACE"}:
+        target_cols = ["pIC50"] if dataset_name == "BACE" else None
+        dataset = CSVMoleculeDataset(
+            root=data_dir / dataset_name,
+            csv_file=data_dir / dataset_name / f"{dataset_name.lower()}.csv",
+            target_cols=target_cols,
+        )
+    elif task_type == "regression":
+        dataset = MoleculeNet(root=data_dir, name=dataset_name)
+    else:
+        dataset = TUDataset(root=data_dir, name=dataset_name)
     output_path = data_dir / f"{dataset_name}.pt"
     input_dim = max(1, dataset.num_features)
-    num_classes = dataset.num_classes
+    target_dim = int(dataset[0].y.numel())
+    num_classes = dataset.num_classes if task_type != "regression" else target_dim
 
     is_dense = model_name in {
         "diff",
@@ -175,6 +236,8 @@ def main(
                 dense_data.edge_attr = None
             if dense_data.x is None or dense_data.x.size(1) == 0:
                 dense_data.x = torch.ones((dense_data.num_nodes, 1))
+            else:
+                dense_data.x = dense_data.x.float()
             dense_data = to_dense(dense_data)
             if dense_data.adj.dim() == 3:
                 dense_data.adj = (
@@ -188,7 +251,7 @@ def main(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
 
-    criterion = torch.nn.CrossEntropyLoss()
+    criterion = torch.nn.MSELoss() if task_type == "regression" else torch.nn.CrossEntropyLoss()
     indices = list(range(len(dataset)))
     splitter = KFold(n_splits=k_folds, shuffle=True, random_state=42)
     fold_splits = list(splitter.split(indices))
@@ -221,6 +284,20 @@ def main(
         validation_dataset = [dataset[i] for i in validation_indices]
         test_dataset = [dataset[i] for i in test_indices]
 
+        if task_type == "regression":
+            # Compute normalization statistics from the training split only.
+            train_targets = torch.cat(
+                [data.y.view(1, -1).float() for data in train_dataset], dim=0
+            )
+            target_mean = train_targets.mean(dim=0).to(device)
+            target_std = train_targets.std(dim=0, unbiased=False).clamp_min(1e-8).to(device)
+            normalized_train_dataset = normalize_regression_dataset(
+                train_dataset, target_mean.cpu(), target_std.cpu()
+            )
+        else:
+            target_mean = target_std = None
+            normalized_train_dataset = train_dataset
+
         # Start the end-to-end run clock before model construction.
         run_start = synchronized_time(device)
 
@@ -228,6 +305,10 @@ def main(
             dense_train_dataset = [dense_dataset[i] for i in train_indices]
             dense_validation_dataset = [dense_dataset[i] for i in validation_indices]
             dense_test_dataset = [dense_dataset[i] for i in test_indices]
+            if task_type == "regression":
+                dense_train_dataset = normalize_regression_dataset(
+                    dense_train_dataset, target_mean.cpu(), target_std.cpu()
+                )
             train_loader = DenseDataLoader(
                 dense_train_dataset, batch_size=batch_size, shuffle=True
             )
@@ -239,7 +320,7 @@ def main(
             )
         else:
             train_loader = DataLoader(
-                train_dataset, batch_size=batch_size, shuffle=True
+                normalized_train_dataset, batch_size=batch_size, shuffle=True
             )
             validation_loader = DataLoader(
                 validation_dataset, batch_size=batch_size, shuffle=False
@@ -257,6 +338,7 @@ def main(
                 pratio=pratio,
                 dropout=dropout,
                 max_nodes=max_nodes,
+                output_dim=target_dim if task_type == "regression" else None,
             ).to(device)
         elif model_name in {"count1", "count2", "count4"}:
             model = CountSketchPooling(
@@ -267,6 +349,7 @@ def main(
                 pratio=pratio,
                 dropout=dropout,
                 mp_layer=mp_layer,
+                output_dim=target_dim if task_type == "regression" else None,
             ).to(device)
         else:
             model = sparse_pooling(
@@ -277,6 +360,7 @@ def main(
                 pratio=pratio,
                 dropout=dropout,
                 mp_layer=mp_layer,
+                output_dim=target_dim if task_type == "regression" else None,
             ).to(device)
 
         optimizer = torch.optim.Adam(
@@ -296,6 +380,9 @@ def main(
             torch.cuda.reset_peak_memory_stats(device)
         training_start = synchronized_time(device)
         run_pool_time = 0.0
+        best_val_mse = float("inf")
+        best_state = None
+        epochs_without_improvement = 0
 
         for epoch in range(1, epochs + 1):
             model.reset_pool_timing()
@@ -306,10 +393,13 @@ def main(
                 batch = batch.to(device)
                 optimizer.zero_grad()
                 output = forward_model(model, batch, device, is_dense)
-                target = batch.y.view(-1)
-                # Match the benchmark paper: optimize classification loss only.
-                # Pooling auxiliary objectives remain available on the model for
-                # diagnostics but are not added to the training objective.
+                if task_type == "regression":
+                    target = batch.y.float()
+                else:
+                    target = batch.y.view(-1)
+                    # Match the benchmark paper: optimize classification loss only.
+                    # Pooling auxiliary objectives remain available on the model for
+                    # diagnostics but are not added to the training objective.
                 loss = criterion(output, target)
                 loss.backward()
                 optimizer.step()
@@ -327,16 +417,48 @@ def main(
                 f"- Pool Time: {model.last_pool_time:.2f}s"
             )
 
+            if task_type == "regression":
+                epoch_validation = evaluate_regression(
+                    model, validation_loader, device, is_dense,
+                    target_mean, target_std
+                )
+                if epoch_validation["mse"] < best_val_mse - args.tolerance:
+                    best_val_mse = epoch_validation["mse"]
+                    best_state = {
+                        key: value.detach().cpu().clone()
+                        for key, value in model.state_dict().items()
+                    }
+                    epochs_without_improvement = 0
+                else:
+                    epochs_without_improvement += 1
+                    if epochs_without_improvement >= args.early_stop:
+                        logger.info(
+                            f"Seed {seed}, Fold {fold}: early stopping at epoch {epoch}"
+                        )
+                        break
+
         training_time = synchronized_time(device) - training_start
         training_times.append(training_time)
         evaluation_start = synchronized_time(device)
 
-        validation_metrics = evaluate_classification(
-            model, validation_loader, device, is_dense
-        )
-        test_metrics = evaluate_classification(
-            model, test_loader, device, is_dense
-        )
+        if task_type == "regression":
+            if best_state is not None:
+                model.load_state_dict(best_state)
+            validation_metrics = evaluate_regression(
+                model, validation_loader, device, is_dense,
+                target_mean, target_std
+            )
+            test_metrics = evaluate_regression(
+                model, test_loader, device, is_dense,
+                target_mean, target_std
+            )
+        else:
+            validation_metrics = evaluate_classification(
+                model, validation_loader, device, is_dense
+            )
+            test_metrics = evaluate_classification(
+                model, test_loader, device, is_dense
+            )
         evaluation_time = synchronized_time(device) - evaluation_start
         evaluation_times.append(evaluation_time)
         end_to_end_time = synchronized_time(device) - run_start
@@ -354,18 +476,32 @@ def main(
         )
         fold_metrics.append(test_metrics)
         validation_fold_metrics.append(validation_metrics)
-        logger.info(
-            f"Seed {seed}, Fold {fold} validation - "
-            f"Accuracy: {validation_metrics['accuracy']:.4f}, "
-            f"Micro-F1: {validation_metrics['micro_f1']:.4f}, "
-            f"Macro-F1: {validation_metrics['macro_f1']:.4f}"
-        )
-        logger.info(
-            f"Seed {seed}, Fold {fold} test - "
-            f"Accuracy: {test_metrics['accuracy']:.4f}, "
-            f"Micro-F1: {test_metrics['micro_f1']:.4f}, "
-            f"Macro-F1: {test_metrics['macro_f1']:.4f}"
-        )
+        if task_type == "regression":
+            logger.info(
+                f"Seed {seed}, Fold {fold} validation - "
+                f"MSE: {validation_metrics['mse']:.4f}, "
+                f"RMSE: {validation_metrics['rmse']:.4f}, "
+                f"MAE: {validation_metrics['mae']:.4f}"
+            )
+            logger.info(
+                f"Seed {seed}, Fold {fold} test - "
+                f"MSE: {test_metrics['mse']:.4f}, "
+                f"RMSE: {test_metrics['rmse']:.4f}, "
+                f"MAE: {test_metrics['mae']:.4f}"
+            )
+        else:
+            logger.info(
+                f"Seed {seed}, Fold {fold} validation - "
+                f"Accuracy: {validation_metrics['accuracy']:.4f}, "
+                f"Micro-F1: {validation_metrics['micro_f1']:.4f}, "
+                f"Macro-F1: {validation_metrics['macro_f1']:.4f}"
+            )
+            logger.info(
+                f"Seed {seed}, Fold {fold} test - "
+                f"Accuracy: {test_metrics['accuracy']:.4f}, "
+                f"Micro-F1: {test_metrics['micro_f1']:.4f}, "
+                f"Macro-F1: {test_metrics['macro_f1']:.4f}"
+            )
 
     total_end_to_end_time = sum(end_to_end_times)
     logger.info(
@@ -393,9 +529,14 @@ def main(
         key: sum(metrics[key] for metrics in fold_metrics) / total_runs
         for key in fold_metrics[0]
     }
-    logger.info(f"Average Accuracy: {average_metrics['accuracy']:.4f}")
-    logger.info(f"Average Micro-F1: {average_metrics['micro_f1']:.4f}")
-    logger.info(f"Average Macro-F1: {average_metrics['macro_f1']:.4f}")
+    if task_type == "regression":
+        logger.info(f"Average MSE: {average_metrics['mse']:.4f}")
+        logger.info(f"Average RMSE: {average_metrics['rmse']:.4f}")
+        logger.info(f"Average MAE: {average_metrics['mae']:.4f}")
+    else:
+        logger.info(f"Average Accuracy: {average_metrics['accuracy']:.4f}")
+        logger.info(f"Average Micro-F1: {average_metrics['micro_f1']:.4f}")
+        logger.info(f"Average Macro-F1: {average_metrics['macro_f1']:.4f}")
 
     if device.type == "cuda":
         logger.info(
@@ -405,31 +546,44 @@ def main(
     else:
         logger.info("GPU usage: unavailable (running on CPU)")
 
-    logger.info(f"Loaded {len(dataset)} graphs from the {dataset_name} TU dataset.")
+    logger.info(f"Loaded {len(dataset)} graphs from the {dataset_name} dataset.")
     logger.info(f"Saved dataset to {output_path}")
 
-    save_to_csv(
-        args=args,
-        task_type="multiclass",
-        timestamp=timestamp,
-        times=end_to_end_times,
-        memories=fold_memories if fold_memories else [0.0],
-        max_nodes=max_nodes,
-        best_val_accs=[
-            metrics["accuracy"] for metrics in validation_fold_metrics
-        ],
-        best_test_accs=[
-            metrics["accuracy"] for metrics in fold_metrics
-        ],
-        best_test_macro_f1s=[
-            metrics["macro_f1"] for metrics in fold_metrics
-        ],
-        end_to_end_times=end_to_end_times,
-        training_times=training_times,
-        evaluation_times=evaluation_times,
-        pool_times=pool_times,
-        preprocessing_times=[preprocessing_time],
-    )
+    if task_type == "regression":
+        save_to_csv(
+            args=args,
+            task_type="regression",
+            timestamp=timestamp,
+            times=end_to_end_times,
+            memories=fold_memories if fold_memories else [0.0],
+            max_nodes=max_nodes,
+            best_val_mses=[metrics["mse"] for metrics in validation_fold_metrics],
+            best_test_mses=[metrics["mse"] for metrics in fold_metrics],
+            best_test_rmses=[metrics["rmse"] for metrics in fold_metrics],
+            best_test_maes=[metrics["mae"] for metrics in fold_metrics],
+            end_to_end_times=end_to_end_times,
+            training_times=training_times,
+            evaluation_times=evaluation_times,
+            pool_times=pool_times,
+            preprocessing_times=[preprocessing_time],
+        )
+    else:
+        save_to_csv(
+            args=args,
+            task_type="multiclass",
+            timestamp=timestamp,
+            times=end_to_end_times,
+            memories=fold_memories if fold_memories else [0.0],
+            max_nodes=max_nodes,
+            best_val_accs=[metrics["accuracy"] for metrics in validation_fold_metrics],
+            best_test_accs=[metrics["accuracy"] for metrics in fold_metrics],
+            best_test_macro_f1s=[metrics["macro_f1"] for metrics in fold_metrics],
+            end_to_end_times=end_to_end_times,
+            training_times=training_times,
+            evaluation_times=evaluation_times,
+            pool_times=pool_times,
+            preprocessing_times=[preprocessing_time],
+        )
 
 
 if __name__ == "__main__":
@@ -445,6 +599,12 @@ if __name__ == "__main__":
             "NCI1",
             "NCI109",
             "COLLAB",
+            "ESOL",
+            "FreeSolv",
+            "lipo",
+            "QM7",
+            "QM8",
+            "BACE",
         ),
         default="DD",
         help="TU dataset to use.",

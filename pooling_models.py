@@ -974,6 +974,7 @@ class SparsePooling(nn.Module):
         pratio: float = 0.5,
         dropout: float = 0.5,
         mp_layer: str = "graphconv",
+        output_dim=None,
     ):
         super().__init__()
 
@@ -1035,7 +1036,9 @@ class SparsePooling(nn.Module):
         self.model = model
         self.mp_layer = mp_layer
         self.dropout = nn.Dropout(dropout)
-        self.classifier = nn.Linear(2 * hidden, num_classes)
+        self.classifier = nn.Linear(
+            2 * hidden, num_classes if output_dim is None else output_dim
+        )
         self.last_pool_time = 0.0
         self._pool_events = []
         self._pool_cpu_time = 0.0
@@ -1140,6 +1143,7 @@ class CountSketchPooling(nn.Module):
         pratio: float = 0.5,
         dropout: float = 0.2,
         mp_layer: str = "graphconv",
+        output_dim=None,
     ):
         super().__init__()
         if q not in {1, 2, 4}:
@@ -1152,7 +1156,9 @@ class CountSketchPooling(nn.Module):
         self.conv2 = make_message_passing_layer(mp_layer, hidden, hidden)
         self.conv3 = make_message_passing_layer(mp_layer, hidden, hidden)
         self.dropout = nn.Dropout(dropout)
-        self.classifier = nn.Linear(2 * hidden, num_classes)
+        self.classifier = nn.Linear(
+            2 * hidden, num_classes if output_dim is None else output_dim
+        )
         self.last_pool_time = 0.0
         self._pool_events = []
         self._pool_cpu_time = 0.0
@@ -1515,6 +1521,7 @@ class DensePool(nn.Module):
         pratio: float = 0.5,
         dropout: float = 0.2,
         max_nodes: int = 500,
+        output_dim=None,
     ):
         super().__init__()
 
@@ -1545,7 +1552,9 @@ class DensePool(nn.Module):
             hidden, second_num_clusters, model, pratio
         )
         self.dropout = nn.Dropout(dropout)
-        self.classifier = nn.Linear(2 * hidden, num_classes)
+        self.classifier = nn.Linear(
+            2 * hidden, num_classes if output_dim is None else output_dim
+        )
         self.last_pool_time = 0.0
         self.last_auxiliary_loss = None
         self._pool_events = []
