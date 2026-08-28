@@ -8,7 +8,7 @@ from datetime import datetime
 import torch
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import KFold
-from torch_geometric.datasets import MoleculeNet, TUDataset
+from torch_geometric.datasets import MoleculeNet, QM7b, TUDataset
 from torch_geometric.loader import DataLoader, DenseDataLoader
 from torch_geometric.transforms import ToDense
 
@@ -32,9 +32,31 @@ DENSE_MAX_NODES = {
     "QM7": 32,
     "QM8": 32,
     "BACE": 96,
+    "QM7b": 32,
+    "ENZYMES": 126,
+    "PTC_MR": 109,
+    "AIDS": 200,
+    "MUTAGENICITY": 500,
+    "REDDIT-BINARY": 500,
+    "REDDIT-MULTI-5K": 500,
+    "BZR": 100,
+    "COX2": 100,
+    "DHFR": 100,
+    "MSRC_9": 100,
+    "MSRC_21": 100,
+    "COIL-DEL": 100,
+    "Synthie": 100,
 }
 
-REGRESSION_DATASETS = {"QM7", "QM8", "BACE", "ESOL", "FreeSolv", "lipo"}
+REGRESSION_DATASETS = {
+    "QM7",
+    "QM8",
+    "BACE",
+    "ESOL",
+    "FreeSolv",
+    "lipo",
+    "QM7b",
+}
 
 
 def forward_model(model, batch, device, is_dense):
@@ -192,6 +214,8 @@ def main(
             csv_file=data_dir / dataset_name / f"{dataset_name.lower()}.csv",
             target_cols=target_cols,
         )
+    elif dataset_name == "QM7b":
+        dataset = QM7b(root=data_dir / dataset_name)
     elif task_type == "regression":
         dataset = MoleculeNet(root=data_dir, name=dataset_name)
     else:
@@ -605,6 +629,20 @@ if __name__ == "__main__":
             "QM7",
             "QM8",
             "BACE",
+            "QM7b",
+            "ENZYMES",
+            "PTC_MR",
+            "AIDS",
+            "MUTAGENICITY",
+            "REDDIT-BINARY",
+            "REDDIT-MULTI-5K",
+            "BZR",
+            "COX2",
+            "DHFR",
+            "MSRC_9",
+            "MSRC_21",
+            "COIL-DEL",
+            "Synthie",
         ),
         default="DD",
         help="TU dataset to use.",
