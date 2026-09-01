@@ -239,6 +239,10 @@ def main(
     max_nodes = DENSE_MAX_NODES[dataset_name]
     original_graph_count = len(dataset)
     dataset = [data for data in dataset if data.num_nodes <= max_nodes]
+    # Keep graph-level regression targets independent of node padding.
+    if task_type == "regression":
+        for data in dataset:
+            data.y = data.y.float().view(-1)
     logger.info(
         f"Max-node filter: kept {len(dataset)}/{original_graph_count} graphs "
         f"with at most {max_nodes} nodes"
@@ -254,6 +258,9 @@ def main(
         dense_dataset = []
         for data in dataset:
             dense_data = data.clone()
+            # ToDense may pad graph attributes such as y; preserve the target
+            # separately because regression labels are graph-level values.
+            graph_target = dense_data.y.clone()
             # DenseGCNConv expects a 2D adjacency matrix per graph, so do not
             # let MUTAG edge features create an extra adjacency dimension.
             if getattr(dense_data, "edge_attr", None) is not None:
@@ -263,6 +270,7 @@ def main(
             else:
                 dense_data.x = dense_data.x.float()
             dense_data = to_dense(dense_data)
+            dense_data.y = graph_target
             if dense_data.adj.dim() == 3:
                 dense_data.adj = (
                     dense_data.adj.abs().sum(dim=-1) > 0
