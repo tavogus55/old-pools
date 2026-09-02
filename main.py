@@ -233,9 +233,6 @@ def main(
         "dmon",
         "hosc",
         "justb",
-        "count1-d",
-        "count2-d",
-        "count4-d",
     }
     # Apply the same graph-size limit to every model so sparse and dense
     # methods process exactly the same dataset and cross-validation splits.
@@ -365,31 +362,21 @@ def main(
             )
 
         if is_dense:
-            dense_model_name = (
-                model_name[:-2] if model_name.endswith("-d") else model_name
-            )
             model = DensePool(
                 input_dim,
                 num_classes,
-                model=dense_model_name,
+                model=model_name,
                 hidden=hidden,
                 pratio=pratio,
                 dropout=dropout,
                 max_nodes=max_nodes,
                 output_dim=target_dim if task_type == "regression" else None,
             ).to(device)
-        elif model_name in {
-            "count1", "count2", "count4",
-            "count1-s", "count2-s", "count4-s",
-        }:
-            count_q = int(
-                model_name[5] if model_name.endswith("-s")
-                else model_name.removeprefix("count")
-            )
+        elif model_name in {"count1", "count2", "count4"}:
             model = CountSketchPooling(
                 input_dim,
                 num_classes,
-                q=count_q,
+                q=int(model_name.removeprefix("count")),
                 hidden=hidden,
                 pratio=pratio,
                 dropout=dropout,
@@ -695,12 +682,6 @@ if __name__ == "__main__":
             "count1",
             "count2",
             "count4",
-            "count1-s",
-            "count2-s",
-            "count4-s",
-            "count1-d",
-            "count2-d",
-            "count4-d",
         ),
         default="topk",
         help="Pooling layer to use.",
