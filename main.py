@@ -18,34 +18,34 @@ from utils import get_logger, log_experiment_settings, save_to_csv
 
 
 DENSE_MAX_NODES = {
-    "MUTAG": 150,
+    "MUTAG": 300,
     "DD": 500,
     "IMDB-MULTI": 500,
     "PROTEINS": 700,
     "IMDB-BINARY": 500,
-    "COLLAB": 150,
-    "NCI1": 150,
-    "NCI109": 150,
-    "ESOL": 64,
-    "FreeSolv": 32,
-    "lipo": 128,
-    "QM7": 32,
-    "QM8": 32,
-    "BACE": 96,
-    "QM7b": 32,
-    "ENZYMES": 126,
-    "PTC_MR": 109,
+    "COLLAB": 300,
+    "NCI1": 300,
+    "NCI109": 300,
+    "ESOL": 300,
+    "FreeSolv": 300,
+    "lipo": 300,
+    "QM7": 200,
+    "QM8": 200,
+    "BACE": 300,
+    "QM7b": 200,
+    "ENZYMES": 300,
+    "PTC_MR": 300,
     "AIDS": 200,
     "MUTAGENICITY": 500,
     "REDDIT-BINARY": 500,
     "REDDIT-MULTI-5K": 500,
-    "BZR": 100,
-    "COX2": 100,
-    "DHFR": 100,
-    "MSRC_9": 100,
-    "MSRC_21": 100,
-    "COIL-DEL": 100,
-    "Synthie": 100,
+    "BZR": 300,
+    "COX2": 300,
+    "DHFR": 300,
+    "MSRC_9": 300,
+    "MSRC_21": 300,
+    "COIL-DEL": 300,
+    "Synthie": 300,
 }
 
 REGRESSION_DATASETS = {
@@ -158,7 +158,8 @@ def evaluate_regression(model, loader, device, is_dense, target_mean, target_std
         for batch in loader:
             batch = batch.to(device)
             output = forward_model(model, batch, device, is_dense)
-            target = batch.y.float()
+            # Keep multi-target regression labels (QM7b has 14 targets) aligned with the model output.
+            target = batch.y.float().view_as(output)
             output = output * target_std + target_mean
             predictions.append(output.view(-1).cpu())
             targets.append(target.view(-1).cpu())
@@ -426,7 +427,8 @@ def main(
                 optimizer.zero_grad()
                 output = forward_model(model, batch, device, is_dense)
                 if task_type == "regression":
-                    target = batch.y.float()
+                    # Match one or many regression targets to the graph-level output shape.
+                    target = batch.y.float().view_as(output)
                 else:
                     target = batch.y.view(-1)
                     # Match the benchmark paper: optimize classification loss only.
