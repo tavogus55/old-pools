@@ -277,21 +277,32 @@ def countsketch_pool(
 
     # Sample graph-local buckets and offset them into the batched cluster space.
     p_node = num_clusters_per_graph[batch]
-    rows, valid, q_node = sample_countsketch_rows(p_node, q)
-    rows = rows + pool_ptr[batch][:, None]
+    if q == 1:
+        # Count1 has exactly one non-zero assignment per node. This is the
+        # same CountSketch operation as the generic path, but avoids building
+        # q-shaped validity/sign tensors and the q-by-q edge-event view.
+        rows = (torch.rand(n, device=x.device) * p_node).long() + pool_ptr[batch]
+        signs = x.new_empty(n).random_(2).mul_(2).sub_(1)
+        pooled_x = x.new_zeros((total_clusters, feature_dim))
+        pooled_x.index_add_(0, rows, signs[:, None] * x)
+    else:
+        rows, valid, q_node = sample_countsketch_rows(p_node, q)
+        rows = rows + pool_ptr[batch][:, None]
 
-    # Generate the same scaled Rademacher signs used by CountSketch.
-    signs = x.new_empty((n, q)).random_(2).mul_(2).sub_(1)
-    signs *= valid / q_node.to(x.dtype).sqrt()[:, None]
+        # Generate the same scaled Rademacher signs used by CountSketch.
+        signs = x.new_empty((n, q)).random_(2).mul_(2).sub_(1)
+        signs *= valid / q_node.to(x.dtype).sqrt()[:, None]
 
-    # Original operation: X_pool = S X, using only non-zero assignments.
-    pooled_x = x.new_zeros((total_clusters, feature_dim))
-    for assignment in range(q):
-        keep = valid[:, assignment]
-        pooled_x = pooled_x.index_add(
+        # Original operation: X_pool = S X, using only non-zero assignments.
+        # Flattening q assignments turns q small Python index_add calls into
+        # one indexed accumulation without changing the result.
+        keep = valid.reshape(-1)
+        pooled_x = x.new_zeros((total_clusters, feature_dim))
+        expanded_x = x[:, None, :].expand(-1, q, -1).reshape(-1, feature_dim)
+        pooled_x.index_add_(
             0,
-            rows[keep, assignment],
-            signs[keep, assignment, None] * x[keep],
+            rows.reshape(-1)[keep],
+            signs.reshape(-1)[keep, None] * expanded_x[keep],
         )
 
     src, dst = edge_index
@@ -302,14 +313,19 @@ def countsketch_pool(
 
     # Original operation: A_pool = S A S.T. Each edge produces at most q^2
     # pooled-edge events, which are combined by sparse COO coalescing.
-    pair = valid[src, :, None] & valid[dst, None, :]
-    out_src = rows[src, :, None].expand(-1, q, q)[pair]
-    out_dst = rows[dst, None, :].expand(-1, q, q)[pair]
-    out_weight = (
-        edge_weight[:, None, None]
-        * signs[src, :, None]
-        * signs[dst, None, :]
-    )[pair]
+    if q == 1:
+        out_src = rows[src]
+        out_dst = rows[dst]
+        out_weight = edge_weight * signs[src] * signs[dst]
+    else:
+        pair = valid[src, :, None] & valid[dst, None, :]
+        out_src = rows[src, :, None].expand(-1, q, q)[pair]
+        out_dst = rows[dst, None, :].expand(-1, q, q)[pair]
+        out_weight = (
+            edge_weight[:, None, None]
+            * signs[src, :, None]
+            * signs[dst, None, :]
+        )[pair]
 
     pooled_adjacency = torch.sparse_coo_tensor(
         torch.stack((out_src, out_dst)),
