@@ -290,9 +290,15 @@ def main(
     fold_splits = list(splitter.split(indices))
     end_to_end_times = []
     training_times = []
+    training_epoch_counts = []
     evaluation_times = []
+    inference_times = []
+    inference_throughputs = []
+    test_graph_counts = []
     pool_times = []
     fold_memories = []
+    training_peak_memories = []
+    inference_peak_memories = []
     fold_metrics = []
     validation_fold_metrics = []
 
@@ -413,6 +419,8 @@ def main(
             torch.cuda.reset_peak_memory_stats(device)
         training_start = synchronized_time(device)
         run_pool_time = 0.0
+        run_training_time = 0.0
+        completed_epochs = 0
         best_val_mse = float("inf")
         best_state = None
         epochs_without_improvement = 0
@@ -444,6 +452,8 @@ def main(
             run_pool_time += model.last_pool_time
             average_loss = total_loss / len(train_loader)
             epoch_duration = time.perf_counter() - epoch_start
+            run_training_time += epoch_duration
+            completed_epochs += 1
             logger.info(
                 f"Seed {seed}, Fold {fold} Epoch {epoch}/{epochs} "
                 f"- loss: {average_loss:.4f} "
@@ -471,8 +481,18 @@ def main(
                         )
                         break
 
-        training_time = synchronized_time(device) - training_start
+        # Training time excludes validation and final test inference. The
+        # epoch count reflects early stopping when it terminates a run early.
+        training_time = run_training_time
         training_times.append(training_time)
+        training_epoch_counts.append(completed_epochs)
+        training_peak_memory = 0.0
+        if device.type == "cuda":
+            training_peak_memory = (
+                torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+            )
+            training_peak_memories.append(training_peak_memory)
+
         evaluation_start = synchronized_time(device)
 
         if task_type == "regression":
@@ -482,31 +502,52 @@ def main(
                 model, validation_loader, device, is_dense,
                 target_mean, target_std
             )
+            validation_time = synchronized_time(device) - evaluation_start
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
+            test_start = synchronized_time(device)
             test_metrics = evaluate_regression(
                 model, test_loader, device, is_dense,
                 target_mean, target_std
             )
+            inference_time = synchronized_time(device) - test_start
         else:
             validation_metrics = evaluate_classification(
                 model, validation_loader, device, is_dense
             )
+            validation_time = synchronized_time(device) - evaluation_start
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
+            test_start = synchronized_time(device)
             test_metrics = evaluate_classification(
                 model, test_loader, device, is_dense
             )
+            inference_time = synchronized_time(device) - test_start
         evaluation_time = synchronized_time(device) - evaluation_start
         evaluation_times.append(evaluation_time)
+        inference_times.append(inference_time)
+        test_graph_counts.append(len(test_dataset))
+        inference_throughputs.append(
+            len(test_dataset) / max(inference_time, 1e-12)
+        )
+        inference_peak_memory = 0.0
+        if device.type == "cuda":
+            inference_peak_memory = (
+                torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+            )
+            inference_peak_memories.append(inference_peak_memory)
         end_to_end_time = synchronized_time(device) - run_start
         end_to_end_times.append(end_to_end_time)
         pool_times.append(run_pool_time)
-        if device.type == "cuda":
-            fold_memories.append(
-                torch.cuda.max_memory_reserved(device) / (1024 ** 2)
-            )
+        fold_memories.append(max(training_peak_memory, inference_peak_memory))
         logger.info(
             f"Seed {seed}, Fold {fold} timing - "
             f"End-to-end: {end_to_end_time:.2f}s, "
             f"Training: {training_time:.2f}s, "
-            f"Evaluation: {evaluation_time:.2f}s"
+            f"Evaluation: {evaluation_time:.2f}s, "
+            f"Test inference: {inference_time:.2f}s, "
+            f"Training epochs: {completed_epochs}, "
+            f"Throughput: {inference_throughputs[-1]:.2f} graphs/s"
         )
         fold_metrics.append(test_metrics)
         validation_fold_metrics.append(validation_metrics)
@@ -551,12 +592,30 @@ def main(
         f"{sum(training_times) / total_runs:.2f}s"
     )
     logger.info(
+        f"Average training time per epoch: "
+        f"{sum(training_times) / max(sum(training_epoch_counts), 1):.2f}s"
+    )
+    logger.info(
+        f"Total training epochs across runs: {sum(training_epoch_counts)}"
+    )
+    logger.info(
+        f"Total training time across runs: {sum(training_times):.2f}s"
+    )
+    logger.info(
         f"Average evaluation time per run: "
         f"{sum(evaluation_times) / total_runs:.2f}s"
     )
     logger.info(
         f"Average pooling time per run: "
         f"{sum(pool_times) / total_runs:.2f}s"
+    )
+    logger.info(
+        f"Total test inference time across runs: "
+        f"{sum(inference_times):.2f}s"
+    )
+    logger.info(
+        f"Test throughput across runs: "
+        f"{sum(test_graph_counts) / max(sum(inference_times), 1e-12):.2f} graphs/s"
     )
 
     average_metrics = {
@@ -576,6 +635,14 @@ def main(
         logger.info(
             f"Average peak GPU memory reserved: "
             f"{sum(fold_memories) / len(fold_memories):.2f} MB"
+        )
+        logger.info(
+            f"Peak training GPU memory reserved: "
+            f"{max(training_peak_memories):.2f} MB"
+        )
+        logger.info(
+            f"Peak inference GPU memory reserved: "
+            f"{max(inference_peak_memories):.2f} MB"
         )
     else:
         logger.info("GPU usage: unavailable (running on CPU)")
@@ -598,6 +665,11 @@ def main(
             end_to_end_times=end_to_end_times,
             training_times=training_times,
             evaluation_times=evaluation_times,
+            inference_times=inference_times,
+            training_epoch_counts=training_epoch_counts,
+            training_peak_memories=training_peak_memories,
+            inference_peak_memories=inference_peak_memories,
+            test_graph_counts=test_graph_counts,
             pool_times=pool_times,
             preprocessing_times=[preprocessing_time],
         )
@@ -615,6 +687,11 @@ def main(
             end_to_end_times=end_to_end_times,
             training_times=training_times,
             evaluation_times=evaluation_times,
+            inference_times=inference_times,
+            training_epoch_counts=training_epoch_counts,
+            training_peak_memories=training_peak_memories,
+            inference_peak_memories=inference_peak_memories,
+            test_graph_counts=test_graph_counts,
             pool_times=pool_times,
             preprocessing_times=[preprocessing_time],
         )

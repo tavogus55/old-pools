@@ -102,6 +102,11 @@ def save_to_csv(
     end_to_end_times=None,
     training_times=None,
     evaluation_times=None,
+    inference_times=None,
+    training_epoch_counts=None,
+    training_peak_memories=None,
+    inference_peak_memories=None,
+    test_graph_counts=None,
     pool_times=None,
     preprocessing_times=None,
     save_dir="results",
@@ -115,6 +120,16 @@ def save_to_csv(
         training_times = times
     if evaluation_times is None:
         evaluation_times = [0.0]
+    if inference_times is None:
+        inference_times = evaluation_times
+    if training_epoch_counts is None:
+        training_epoch_counts = [args.epochs] * len(training_times)
+    if training_peak_memories is None:
+        training_peak_memories = [0.0]
+    if inference_peak_memories is None:
+        inference_peak_memories = [0.0]
+    if test_graph_counts is None:
+        test_graph_counts = [0] * len(inference_times)
     if pool_times is None:
         pool_times = [0.0]
     if preprocessing_times is None:
@@ -141,10 +156,23 @@ def save_to_csv(
         "avg_time": np.mean(end_to_end_times),
         "var_time": np.var(end_to_end_times),
         "avg_training_time": np.mean(training_times),
+        "avg_training_time_per_epoch": (
+            np.sum(training_times) / max(np.sum(training_epoch_counts), 1)
+        ),
+        "avg_training_epochs": np.mean(training_epoch_counts),
+        "total_training_epochs": np.sum(training_epoch_counts),
+        "total_training_time": np.sum(training_times),
         "avg_evaluation_time": np.mean(evaluation_times),
+        "avg_inference_time": np.mean(inference_times),
+        "total_inference_time": np.sum(inference_times),
+        "test_throughput_graphs_per_sec": (
+            np.sum(test_graph_counts) / max(np.sum(inference_times), 1e-12)
+        ),
         "avg_pool_time": np.mean(pool_times),
         "avg_preprocessing_time": np.mean(preprocessing_times),
         "avg_memory_mb": np.mean(memories),
+        "peak_training_gpu_memory_mb": np.max(training_peak_memories),
+        "peak_inference_gpu_memory_mb": np.max(inference_peak_memories),
     }
 
     if task_type == "regression":
