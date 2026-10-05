@@ -422,6 +422,7 @@ def main(
         run_training_time = 0.0
         completed_epochs = 0
         best_val_mse = float("inf")
+        best_val_macro_f1 = float("-inf")
         best_state = None
         epochs_without_improvement = 0
 
@@ -480,6 +481,31 @@ def main(
                             f"Seed {seed}, Fold {fold}: early stopping at epoch {epoch}"
                         )
                         break
+            else:
+                # Use validation Macro-F1 for classification early stopping so
+                # the patience setting applies to PROTEINS and every other
+                # multiclass dataset as well as to regression datasets.
+                epoch_validation = evaluate_classification(
+                    model, validation_loader, device, is_dense
+                )
+                if epoch_validation["macro_f1"] > best_val_macro_f1 + args.tolerance:
+                    best_val_macro_f1 = epoch_validation["macro_f1"]
+                    best_state = {
+                        key: value.detach().cpu().clone()
+                        for key, value in model.state_dict().items()
+                    }
+                    epochs_without_improvement = 0
+                else:
+                    epochs_without_improvement += 1
+                    if epochs_without_improvement >= args.early_stop:
+                        logger.info(
+                            f"Seed {seed}, Fold {fold}: early stopping at epoch {epoch}"
+                        )
+                        break
+
+            # Validation switches the model to evaluation mode; restore
+            # training mode before the next epoch if patience did not stop it.
+            model.train()
 
         # Training time excludes validation and final test inference. The
         # epoch count reflects early stopping when it terminates a run early.
@@ -512,6 +538,8 @@ def main(
             )
             inference_time = synchronized_time(device) - test_start
         else:
+            if best_state is not None:
+                model.load_state_dict(best_state)
             validation_metrics = evaluate_classification(
                 model, validation_loader, device, is_dense
             )
