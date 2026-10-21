@@ -109,6 +109,7 @@ def save_to_csv(
     test_graph_counts=None,
     pool_times=None,
     preprocessing_times=None,
+    raw_results=None,
     save_dir="results",
 ):
     os.makedirs(save_dir, exist_ok=True)
@@ -135,6 +136,15 @@ def save_to_csv(
     if preprocessing_times is None:
         preprocessing_times = [0.0]
 
+    def std(values):
+        # Use sample standard deviation for mean +/- std reporting.
+        return np.std(values, ddof=1) if len(values) > 1 else 0.0
+
+    training_time_per_epoch = [
+        training_time / max(epochs, 1)
+        for training_time, epochs in zip(training_times, training_epoch_counts)
+    ]
+
     row = {
         "timestamp": timestamp,
         "exp_name": args.exp_name,
@@ -154,50 +164,67 @@ def save_to_csv(
         "tolerance": args.tolerance,
         "seeds": "-".join(map(str, args.seeds)),
         "avg_time": np.mean(end_to_end_times),
+        "std_time": std(end_to_end_times),
         "var_time": np.var(end_to_end_times),
         "avg_training_time": np.mean(training_times),
-        "avg_training_time_per_epoch": (
-            np.sum(training_times) / max(np.sum(training_epoch_counts), 1)
-        ),
+        "std_training_time": std(training_times),
+        "avg_training_time_per_epoch": np.mean(training_time_per_epoch),
+        "std_training_time_per_epoch": std(training_time_per_epoch),
         "avg_training_epochs": np.mean(training_epoch_counts),
+        "std_training_epochs": std(training_epoch_counts),
         "total_training_epochs": np.sum(training_epoch_counts),
         "total_training_time": np.sum(training_times),
         "avg_evaluation_time": np.mean(evaluation_times),
+        "std_evaluation_time": std(evaluation_times),
         "avg_inference_time": np.mean(inference_times),
+        "std_inference_time": std(inference_times),
         "total_inference_time": np.sum(inference_times),
+        "avg_throughput_graphs_per_sec": np.mean(
+            np.asarray(test_graph_counts) / np.maximum(np.asarray(inference_times), 1e-12)
+        ),
+        "std_throughput_graphs_per_sec": std(
+            np.asarray(test_graph_counts) / np.maximum(np.asarray(inference_times), 1e-12)
+        ),
         "test_throughput_graphs_per_sec": (
             np.sum(test_graph_counts) / max(np.sum(inference_times), 1e-12)
         ),
         "avg_pool_time": np.mean(pool_times),
+        "std_pool_time": std(pool_times),
         "avg_preprocessing_time": np.mean(preprocessing_times),
         "avg_memory_mb": np.mean(memories),
+        "std_memory_mb": std(memories),
+        "avg_training_gpu_memory_mb": np.mean(training_peak_memories),
+        "std_training_gpu_memory_mb": std(training_peak_memories),
         "peak_training_gpu_memory_mb": np.max(training_peak_memories),
+        "avg_inference_gpu_memory_mb": np.mean(inference_peak_memories),
+        "std_inference_gpu_memory_mb": std(inference_peak_memories),
         "peak_inference_gpu_memory_mb": np.max(inference_peak_memories),
     }
 
     if task_type == "regression":
         row.update({
             "avg_best_val_mse": np.mean(best_val_mses),
-            "std_best_val_mse": np.std(best_val_mses),
+            "std_best_val_mse": std(best_val_mses),
             "avg_test_mse": np.mean(best_test_mses),
-            "std_test_mse": np.std(best_test_mses),
+            "std_test_mse": std(best_test_mses),
             "avg_test_rmse": np.mean(best_test_rmses),
-            "std_test_rmse": np.std(best_test_rmses),
+            "std_test_rmse": std(best_test_rmses),
             "avg_test_mae": np.mean(best_test_maes),
-            "std_test_mae": np.std(best_test_maes),
+            "std_test_mae": std(best_test_maes),
         })
     else:
         row.update({
             "avg_best_val_acc": np.mean(best_val_accs),
-            "std_best_val_acc": np.std(best_val_accs),
+            "std_best_val_acc": std(best_val_accs),
             "avg_test_acc_micro_f1": np.mean(best_test_accs),
-            "std_test_acc_micro_f1": np.std(best_test_accs),
+            "std_test_acc_micro_f1": std(best_test_accs),
             "avg_macro_f1": np.mean(best_test_macro_f1s),
-            "std_macro_f1": np.std(best_test_macro_f1s),
+            "std_macro_f1": std(best_test_macro_f1s),
         })
 
     fieldnames = list(row.keys())
     file_exists = os.path.exists(csv_path)
+    summary_already_written = False
 
     if file_exists:
         with open(csv_path, "r", newline="") as file:
@@ -213,10 +240,40 @@ def save_to_csv(
                 writer.writeheader()
                 writer.writerows(existing_rows)
                 writer.writerow(row)
-            return
+            summary_already_written = True
 
-    with open(csv_path, "a", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(row)
+    if not summary_already_written:
+        with open(csv_path, "a", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+
+    # Preserve one full-precision row for every seed-fold run.
+    if raw_results:
+        raw_csv_path = os.path.join(save_dir, f"{args.exp_name}_raw.csv")
+        raw_fieldnames = list(raw_results[0].keys())
+        raw_file_exists = os.path.exists(raw_csv_path)
+        if raw_file_exists:
+            with open(raw_csv_path, "r", newline="") as file:
+                raw_reader = csv.DictReader(file)
+                existing_raw_rows = list(raw_reader)
+                existing_raw_fieldnames = raw_reader.fieldnames or []
+            if existing_raw_fieldnames != raw_fieldnames:
+                with open(raw_csv_path, "w", newline="") as file:
+                    writer = csv.DictWriter(file, fieldnames=raw_fieldnames)
+                    writer.writeheader()
+                    writer.writerows(existing_raw_rows)
+                    writer.writerows(raw_results)
+                raw_already_written = True
+            else:
+                raw_already_written = False
+        else:
+            raw_already_written = False
+
+        if not raw_already_written:
+            with open(raw_csv_path, "a", newline="") as file:
+                writer = csv.DictWriter(file, fieldnames=raw_fieldnames)
+                if not raw_file_exists:
+                    writer.writeheader()
+                writer.writerows(raw_results)

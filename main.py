@@ -301,6 +301,7 @@ def main(
     inference_peak_memories = []
     fold_metrics = []
     validation_fold_metrics = []
+    raw_results = []
 
     total_runs = len(seeds) * k_folds
     for run, (seed, (train_val_indices, test_indices)) in enumerate(
@@ -517,7 +518,7 @@ def main(
             training_peak_memory = (
                 torch.cuda.max_memory_reserved(device) / (1024 ** 2)
             )
-            training_peak_memories.append(training_peak_memory)
+        training_peak_memories.append(training_peak_memory)
 
         evaluation_start = synchronized_time(device)
 
@@ -563,7 +564,7 @@ def main(
             inference_peak_memory = (
                 torch.cuda.max_memory_reserved(device) / (1024 ** 2)
             )
-            inference_peak_memories.append(inference_peak_memory)
+        inference_peak_memories.append(inference_peak_memory)
         end_to_end_time = synchronized_time(device) - run_start
         end_to_end_times.append(end_to_end_time)
         pool_times.append(run_pool_time)
@@ -579,6 +580,33 @@ def main(
         )
         fold_metrics.append(test_metrics)
         validation_fold_metrics.append(validation_metrics)
+        raw_result = {
+            "timestamp": timestamp,
+            "exp_name": args.exp_name,
+            "model": model_name,
+            "dataset": dataset_name,
+            "task": task_type,
+            "seed": seed,
+            "fold": fold,
+            "test_graphs": len(test_dataset),
+            "end_to_end_time": end_to_end_time,
+            "training_time": training_time,
+            "training_time_per_epoch": training_time / max(completed_epochs, 1),
+            "training_epochs": completed_epochs,
+            "evaluation_time": evaluation_time,
+            "inference_time": inference_time,
+            "throughput_graphs_per_sec": inference_throughputs[-1],
+            "pool_time": run_pool_time,
+            "training_gpu_memory_mb": training_peak_memory,
+            "inference_gpu_memory_mb": inference_peak_memory,
+            "peak_gpu_memory_mb": max(training_peak_memory, inference_peak_memory),
+            "preprocessing_time": preprocessing_time,
+        }
+        # Keep one stable raw schema across classification and regression runs.
+        for metric_name in ("accuracy", "micro_f1", "macro_f1", "mse", "rmse", "mae"):
+            raw_result[f"validation_{metric_name}"] = validation_metrics.get(metric_name, "")
+            raw_result[f"test_{metric_name}"] = test_metrics.get(metric_name, "")
+        raw_results.append(raw_result)
         if task_type == "regression":
             logger.info(
                 f"Seed {seed}, Fold {fold} validation - "
@@ -700,6 +728,7 @@ def main(
             test_graph_counts=test_graph_counts,
             pool_times=pool_times,
             preprocessing_times=[preprocessing_time],
+            raw_results=raw_results,
         )
     else:
         save_to_csv(
@@ -722,6 +751,7 @@ def main(
             test_graph_counts=test_graph_counts,
             pool_times=pool_times,
             preprocessing_times=[preprocessing_time],
+            raw_results=raw_results,
         )
 
 
