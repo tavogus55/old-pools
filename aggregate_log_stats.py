@@ -2,7 +2,6 @@
 
 import argparse
 import csv
-import math
 import re
 from pathlib import Path
 from statistics import mean, stdev
@@ -140,7 +139,23 @@ def parse_log(path):
     row["gpu_memory_mean_mb"] = next(
         (match.group(1) for match in reversed(memory_matches) if match), ""
     )
-    return row
+    raw_rows = []
+    for (seed, fold), run in sorted(runs.items()):
+        raw_row = {
+            "log_file": row["log_file"],
+            "log_timestamp": row["log_timestamp"],
+            "model": row["model"],
+            "dataset": row["dataset"],
+            "exp_name": row["exp_name"],
+            "task": row["task"],
+            "seed": seed,
+            "fold": fold,
+        }
+        for metric in metric_names:
+            raw_row[metric] = run.get(metric, "")
+        raw_rows.append(raw_row)
+
+    return row, raw_rows
 
 
 def main():
@@ -178,10 +193,10 @@ def main():
     for path in log_files:
         if path.stat().st_size == 0:
             continue
-        row = parse_log(path)
+        row, raw_rows = parse_log(path)
         if requested_experiment and row["exp_name"] not in ("", requested_experiment):
             continue
-        rows.append(row)
+        rows.append({"summary": row, "raw": raw_rows})
     if not rows:
         raise SystemExit("No usable log files found")
 
@@ -189,16 +204,23 @@ def main():
     # dataset. Keep the latest timestamped log for one final row per pair.
     if requested_experiment:
         latest = {}
-        for row in rows:
+        for item in rows:
+            row = item["summary"]
             key = (row["model"], row["dataset"])
             previous = latest.get(key)
             if previous is None or (row["log_timestamp"], row["log_file"]) > (
-                previous["log_timestamp"], previous["log_file"]
+                previous["summary"]["log_timestamp"], previous["summary"]["log_file"]
             ):
-                latest[key] = row
-        rows = sorted(latest.values(), key=lambda row: (row["model"], row["dataset"]))
+                latest[key] = item
+        rows = sorted(
+            latest.values(),
+            key=lambda item: (item["summary"]["model"], item["summary"]["dataset"]),
+        )
 
-    fieldnames = list(rows[0].keys())
+    summary_rows = [item["summary"] for item in rows]
+    raw_rows = [raw for item in rows for raw in item["raw"]]
+    summary_fieldnames = list(summary_rows[0].keys())
+    raw_fieldnames = list(raw_rows[0].keys()) if raw_rows else []
     output = Path(args.output) if args.output else None
     if output is None and requested_experiment:
         output = Path("results") / f"{requested_experiment}-log-stats.csv"
@@ -206,14 +228,24 @@ def main():
     if output:
         output.parent.mkdir(parents=True, exist_ok=True)
         with output.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer = csv.DictWriter(handle, fieldnames=summary_fieldnames)
             writer.writeheader()
-            writer.writerows(rows)
-        print(f"Wrote {len(rows)} method-dataset summaries to {output}")
+            writer.writerows(summary_rows)
+
+        if requested_experiment:
+            raw_output = output.with_name(f"{requested_experiment}-raw-results.csv")
+        else:
+            raw_output = output.with_name(f"{output.stem}-raw-results.csv")
+        with raw_output.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=raw_fieldnames)
+            writer.writeheader()
+            writer.writerows(raw_rows)
+        print(f"Wrote {len(summary_rows)} method-dataset summaries to {output}")
+        print(f"Wrote {len(raw_rows)} seed-fold results to {raw_output}")
     else:
-        writer = csv.DictWriter(__import__("sys").stdout, fieldnames=fieldnames)
+        writer = csv.DictWriter(__import__("sys").stdout, fieldnames=summary_fieldnames)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(summary_rows)
 
 
 if __name__ == "__main__":
