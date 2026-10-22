@@ -133,11 +133,25 @@ def parse_log(path):
         re.search(r"Average peak GPU memory reserved:\s+([0-9.eE+-]+) MB", line)
         for line in lines
     ]
+    training_memory_matches = [
+        re.search(r"Peak training GPU memory reserved:\s+([0-9.eE+-]+) MB", line)
+        for line in lines
+    ]
+    inference_memory_matches = [
+        re.search(r"Peak inference GPU memory reserved:\s+([0-9.eE+-]+) MB", line)
+        for line in lines
+    ]
     row["pooling_time_mean"] = next(
         (match.group(1) for match in reversed(pool_matches) if match), ""
     )
     row["gpu_memory_mean_mb"] = next(
         (match.group(1) for match in reversed(memory_matches) if match), ""
+    )
+    row["peak_training_gpu_memory_mb"] = next(
+        (match.group(1) for match in reversed(training_memory_matches) if match), ""
+    )
+    row["peak_inference_gpu_memory_mb"] = next(
+        (match.group(1) for match in reversed(inference_memory_matches) if match), ""
     )
     raw_rows = []
     for (seed, fold), run in sorted(runs.items()):
