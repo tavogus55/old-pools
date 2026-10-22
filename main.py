@@ -288,6 +288,10 @@ def main(
     indices = list(range(len(dataset)))
     splitter = KFold(n_splits=k_folds, shuffle=True, random_state=42)
     fold_splits = list(splitter.split(indices))
+    # Tuning can request only the first split while keeping the 10-fold
+    # partition definition unchanged. The default runs every fold.
+    if args.folds_to_run > 0:
+        fold_splits = fold_splits[:args.folds_to_run]
     end_to_end_times = []
     training_times = []
     training_epoch_counts = []
@@ -303,22 +307,27 @@ def main(
     validation_fold_metrics = []
     raw_results = []
 
-    total_runs = len(seeds) * k_folds
-    for run, (seed, (train_val_indices, test_indices)) in enumerate(
+    total_runs = len(seeds) * len(fold_splits)
+    for run, (seed, fold, (train_val_indices, test_indices)) in enumerate(
         (
-            (seed, split)
+            (seed, fold_number, split)
             for seed in seeds
-            for split in fold_splits
+            for fold_number, split in enumerate(fold_splits, start=1)
         ),
         start=1,
     ):
-        fold = ((run - 1) % k_folds) + 1
         set_seed(seed)
         train_val_indices = list(train_val_indices)
         random.shuffle(train_val_indices)
         validation_size = max(1, int(0.1 * len(train_val_indices)))
         validation_indices = train_val_indices[:validation_size]
         train_indices = train_val_indices[validation_size:]
+
+        # Final tuning retraining uses the original train+validation graphs
+        # together. The test fold remains untouched and is evaluated only once.
+        if args.retrain_on_train_val:
+            train_indices = train_val_indices
+            validation_indices = train_val_indices
 
         train_dataset = [dataset[i] for i in train_indices]
         validation_dataset = [dataset[i] for i in validation_indices]
@@ -462,6 +471,12 @@ def main(
                 f"- Epoch Time: {epoch_duration:.2f}s "
                 f"- Pool Time: {model.last_pool_time:.2f}s"
             )
+
+            if args.retrain_on_train_val:
+                # The final tuning retrain uses a fixed epoch budget on the
+                # combined train+validation set, so validation is not used
+                # for early stopping or checkpoint selection.
+                continue
 
             if task_type == "regression":
                 epoch_validation = evaluate_regression(
@@ -884,6 +899,12 @@ if __name__ == "__main__":
         help="Number of shuffled cross-validation folds.",
     )
     parser.add_argument(
+        "--folds-to-run",
+        type=int,
+        default=0,
+        help="Run only the first N folds; 0 runs all configured folds.",
+    )
+    parser.add_argument(
         "--seeds",
         type=str,
         nargs="+",
@@ -899,6 +920,11 @@ if __name__ == "__main__":
     parser.add_argument("--exp_name", default="exp")
     parser.add_argument("--tolerance", type=float, default=1e-4)
     parser.add_argument("--early_stop", type=int, default=50)
+    parser.add_argument(
+        "--retrain-on-train-val",
+        action="store_true",
+        help="Train for the full epoch budget on train+validation and evaluate the held-out test fold.",
+    )
     parser.add_argument("--cuda", action="store_true")
     parser.add_argument("--ddp", action="store_true")
     args = parser.parse_args()
