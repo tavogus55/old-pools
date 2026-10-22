@@ -107,7 +107,7 @@ datasets=(
   "Synthie"
 )
 # Node-clustering methods included in the tuning workflow.
-models=("gaus" "unif" "count1" "count2" "count4")
+models=("gaus" "unif" "count1" "count2" "count4" "ndrp")
 
 # Optional comma-separated command-line overrides, for example:
 # DATASETS=DD MODELS=gaus,unif bash run_hyperparameter_tuning.sh
@@ -147,7 +147,9 @@ candidate_directory="${experiment_directory}/candidates"
 final_directory="${experiment_directory}/final"
 mkdir -p "${candidate_directory}" "${final_directory}"
 manifest_file="${experiment_directory}/${EXPERIMENT_NAME}_tuning_manifest.csv"
-echo "dataset,model,selected_learning_rate,selected_weight_decay,selected_dropout,selected_batch_size,hidden,pratio,folds,folds_used,seeds,epochs,early_stop,final_experiment,final_result" > "${manifest_file}"
+if [[ ! -f "${manifest_file}" ]]; then
+  echo "dataset,model,selected_learning_rate,selected_weight_decay,selected_dropout,selected_batch_size,hidden,pratio,folds,folds_used,seeds,epochs,early_stop,final_experiment,final_result" > "${manifest_file}"
+fi
 
 if [[ "${QUICK_TEST}" == "1" ]]; then
   candidate_count=1
@@ -171,6 +173,14 @@ csv_field() {
       exit
     }
   ' "${file}"
+}
+
+manifest_has_pair() {
+  local dataset="$1"
+  local model="$2"
+  awk -F, -v requested_dataset="${dataset}" -v requested_model="${model}" \
+    'NR > 1 && $1 == requested_dataset && $2 == requested_model { found = 1 } END { exit(found ? 0 : 1) }' \
+    "${manifest_file}"
 }
 
 is_regression_dataset() {
@@ -197,6 +207,30 @@ run_candidate() {
   local stored_result_file="${candidate_directory}/${candidate_name}.csv"
 
   echo "Tuning ${run_number}/${total_runs} - ${model} on ${dataset} - ${stage} - ${configuration}"
+
+  # Resume support: a completed candidate is identified by its stored CSV.
+  # Reuse it instead of launching main.py again.
+  if [[ ! -f "${stored_result_file}" && -f "${result_file}" ]]; then
+    mv -f "${result_file}" "${stored_result_file}"
+    if [[ -f "${raw_result_file}" ]]; then
+      mv -f "${raw_result_file}" "${candidate_directory}/${candidate_name}_raw.csv"
+    fi
+  fi
+
+  if [[ -f "${stored_result_file}" ]]; then
+    echo "  Resuming: reusing ${stored_result_file}"
+    if is_regression_dataset "${dataset}"; then
+      CANDIDATE_SCORE="$(csv_field "${stored_result_file}" avg_best_val_mse)"
+    else
+      CANDIDATE_SCORE="$(csv_field "${stored_result_file}" avg_best_val_acc)"
+    fi
+    [[ -n "${CANDIDATE_SCORE}" ]] || {
+      echo "Stored candidate has no validation score: ${stored_result_file}" >&2
+      exit 1
+    }
+    CANDIDATE_NAME="${candidate_name}"
+    return
+  fi
 
   local args=(
     main.py
@@ -299,7 +333,9 @@ for dataset in "${datasets[@]}"; do
     selected_batch_size="128"
 
     stage_summary_file="${candidate_directory}/${EXPERIMENT_NAME}_candidates_${dataset}_${model}.csv"
-    echo "candidate,stage,learning_rate,weight_decay,dropout,batch_size,validation_score,dataset,model" > "${stage_summary_file}"
+    if [[ ! -f "${stage_summary_file}" ]]; then
+      echo "candidate,stage,learning_rate,weight_decay,dropout,batch_size,validation_score,dataset,model" > "${stage_summary_file}"
+    fi
 
     if [[ "${QUICK_TEST}" == "1" ]]; then
       # Run exactly one candidate before the final retraining, solely to
@@ -322,6 +358,13 @@ for dataset in "${datasets[@]}"; do
     final_result="results/${final_name}.csv"
     final_raw_result="results/${final_name}_raw.csv"
     echo "Selected for ${model} on ${dataset}: lr=${selected_lr}, wd=${selected_weight_decay}, dropout=${selected_dropout}, batch_size=${selected_batch_size}"
+
+    # If the final result and manifest row already exist, this pair is fully
+    # complete and can be skipped during a resumed tuning run.
+    if manifest_has_pair "${dataset}" "${model}" && [[ -f "${final_directory}/${final_name}.csv" ]]; then
+      echo "  Resuming: final result already exists for ${model} on ${dataset}"
+      continue
+    fi
 
     final_args=(
       main.py
@@ -356,11 +399,13 @@ for dataset in "${datasets[@]}"; do
       mv -f "${final_raw_result}" "${final_directory}/${final_name}_raw.csv"
     fi
 
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
-      "${dataset}" "${model}" "${selected_lr}" "${selected_weight_decay}" \
-      "${selected_dropout}" "${selected_batch_size}" "${HIDDEN}" "${POOLING_RATIO}" \
-      "${FOLDS}" "1" "${SEEDS}" "${EPOCHS}" "${EARLY_STOP}" "${final_name}" \
-      "${final_directory}/${final_name}.csv" >> "${manifest_file}"
+    if ! manifest_has_pair "${dataset}" "${model}"; then
+      printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        "${dataset}" "${model}" "${selected_lr}" "${selected_weight_decay}" \
+        "${selected_dropout}" "${selected_batch_size}" "${HIDDEN}" "${POOLING_RATIO}" \
+        "${FOLDS}" "1" "${SEEDS}" "${EPOCHS}" "${EARLY_STOP}" "${final_name}" \
+        "${final_directory}/${final_name}.csv" >> "${manifest_file}"
+    fi
   done
 done
 
