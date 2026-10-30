@@ -13,15 +13,13 @@ We want to compare the researcher's graph-pooling methods with existing methods 
 
 The end result should be easy-to-compare tables for a paper and for discussion, with individual-run records behind them so we can check the numbers and recalculate summaries.
 
-The point is to test the ideas fairly, not make sure they win. Negative results are still useful. We shouldn't hide failures, choose datasets because they produce favorable scores, or use test results to pick settings.
-
 ### What we expect, but still need to test
 
 - The proposed methods should be around the comparison group's average or better for predictive performance, rather than consistently last.
 - CountSketch with parameter 1 should be faster than uniform and Gaussian projection.
 - The CountSketch variants and the other proposed methods should generally be faster than DiffPool and MinCut.
 
-These are research expectations, not conditions that the results must satisfy. **(This needs clarification — C22: Is a descriptive comparison enough, or do we need a numerical limit on acceptable performance loss? How should overall ranks be calculated across datasets and metrics?)** No formal equivalence test or non-inferiority margin has been agreed.
+** (This needs clarification — Are these expectations or scientific truths?)** 
 
 ## 2. Who does what, and which information we trust
 
