@@ -483,7 +483,7 @@ def main(
                     model, validation_loader, device, is_dense,
                     target_mean, target_std
                 )
-                if epoch_validation["mse"] < best_val_mse - args.tolerance:
+                if epoch_validation["mse"] < best_val_mse:
                     best_val_mse = epoch_validation["mse"]
                     best_state = {
                         key: value.detach().cpu().clone()
@@ -504,7 +504,7 @@ def main(
                 epoch_validation = evaluate_classification(
                     model, validation_loader, device, is_dense
                 )
-                if epoch_validation["macro_f1"] > best_val_macro_f1 + args.tolerance:
+                if epoch_validation["macro_f1"] > best_val_macro_f1:
                     best_val_macro_f1 = epoch_validation["macro_f1"]
                     best_state = {
                         key: value.detach().cpu().clone()
@@ -908,7 +908,7 @@ if __name__ == "__main__":
         "--seeds",
         type=str,
         nargs="+",
-        default=[str(seed) for seed in range(42, 52)],
+        default=[str(seed) for seed in range(42, 47)],
         help="Random seeds to run for every fold.",
     )
     parser.add_argument(
@@ -918,7 +918,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--log_path", default="local")
     parser.add_argument("--exp_name", default="exp")
-    parser.add_argument("--tolerance", type=float, default=1e-4)
     parser.add_argument("--early_stop", type=int, default=50)
     parser.add_argument(
         "--retrain-on-train-val",

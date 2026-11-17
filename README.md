@@ -12,11 +12,32 @@ Run commands from the project directory:
 python main.py --dataset DD --model topk --epochs 20
 ```
 
-The PowerShell batch runner is:
+## Runner configuration
 
-```powershell
-.\run_experiments.ps1
+Edit `experiments.json` to configure both Bash runners (Git Bash on Windows, or Bash on Linux). The two sections are independent: there is no shared configuration or experiment name.
+
+- `experiments` configures the **default-hyperparameter baseline** run by `run_experiments.sh`. It contains its own experiment name, runtime settings, datasets, and models. Training settings are intentionally omitted, so `main.py`'s argparse defaults are used directly, without duplicating them in JSON or Bash.
+- `tuning` configures the **separate hyperparameter-search experiment** run by `run_hyperparameter_tuning.sh`. It has its own experiment name, runtime settings, datasets/models, training budget, initial hyperparameters, and coordinate-search candidate lists. Changing this section cannot change baseline settings.
+
+```bash
+bash run_experiments.sh
+bash run_hyperparameter_tuning.sh
 ```
+
+Baseline results go to `results/<experiments.experiment_name>.csv`. Tuning artifacts go to `results/hyperparameter_tuning/<tuning.experiment_name>/`. The baseline runner does not load tuning manifests or selected hyperparameters.
+
+To deliberately override an argparse default for a baseline run, add only that non-default setting to `experiments` (for example, `"epochs": 100` or `"seeds": [42]`); otherwise leave it out. Supported optional settings are `epochs`, `folds`, `seeds`, `early_stop`, `mp_layer`, `hidden`, `pooling_ratio`, `learning_rate`, `weight_decay`, `dropout`, `batch_size`, and `use_cuda`.
+
+Tuning starts each coordinate search from its own configured scalar hyperparameters. `quick_test: true` runs one candidate and final retraining per dataset using the first configured model; an explicit `MODELS` environment override retains all supplied models. Both sections require nonempty dataset/model lists.
+
+Nonempty environment overrides still take precedence (`EXP_NAME` for baseline experiments, `EXPERIMENT_NAME` for tuning, `DATASETS`/`MODELS` as comma-separated lists, and uppercase scalar setting names). Use `CONFIG_FILE` to select a different JSON file:
+
+```bash
+CONFIG_FILE=my-experiments.json bash run_experiments.sh
+DATASETS=MUTAG MODELS=gaus QUICK_TEST=1 bash run_hyperparameter_tuning.sh
+```
+
+The default config is resolved beside the scripts. Run from the project directory so `main.py` and result paths resolve correctly. A Python interpreter must be on PATH (or supplied through `PYTHON_BIN`) to read the JSON before PyTorch/Conda detection. `global_settings.json` is generated logging state, not runner configuration.
 
 ## Command-line arguments
 
@@ -39,7 +60,6 @@ The following are the arguments accepted by `main.py` and their current defaults
 | `--log_level` | choice | `info` | Logging level: `debug`, `info`, `warning`, `error`, or `critical`. |
 | `--log_path` | string | `local` | Log-path setting. |
 | `--exp_name` | string | `exp` | Experiment name; results are written to `results/<exp_name>.csv`. |
-| `--tolerance` | float | `1e-4` | Minimum validation improvement used by early stopping. |
 | `--early_stop` | integer | `50` | Number of non-improving validation checks before stopping. |
 | `--cuda` | flag | `False` | CUDA option accepted by the CLI. The current runtime uses CUDA when PyTorch reports it as available. |
 | `--ddp` | flag | `False` | Distributed-training option accepted by the CLI; distributed execution is not currently implemented. |
@@ -145,7 +165,7 @@ Every experiment applies the dataset-specific `max_nodes` limit before creating 
 
 ## Splits and early stopping
 
-The experiment creates shuffled K-fold splits with a fixed splitter seed of `42`. For each fold, 10% of the training portion is used as validation data. The requested training limit is `--epochs`; regression runs can stop earlier when validation performance does not improve by `--tolerance` for `--early_stop` checks. The CSV records the actual number of completed epochs.
+The experiment creates shuffled K-fold splits with a fixed splitter seed of `42`. For each fold, 10% of the training portion is used as validation data. The requested training limit is `--epochs`; runs stop earlier after `--early_stop` consecutive epochs without a strict validation improvement (lower MSE for regression, higher Macro-F1 for classification). Any strict improvement resets patience; ties do not. The default patience is 50 epochs. Retraining with `--retrain-on-train-val` uses the fixed epoch budget without early stopping. The CSV records the actual number of completed epochs.
 
 ## Metrics and output files
 

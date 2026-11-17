@@ -161,7 +161,6 @@ def save_to_csv(
         "k_folds": args.k_folds,
         "pool_ratio": args.pratio,
         "early_stop": args.early_stop,
-        "tolerance": args.tolerance,
         "seeds": "-".join(map(str, args.seeds)),
         "avg_time": np.mean(end_to_end_times),
         "std_time": std(end_to_end_times),

@@ -2,9 +2,10 @@
 
 set -euo pipefail
 
-CONDA_ENV="${CONDA_ENV:-rw-env}"
-CONDA_EXE="${CONDA_EXE:-}"
-PYTHON_BIN="${PYTHON_BIN:-}"
+quick_test_models_override="${MODELS:-}"
+source "$(dirname -- "${BASH_SOURCE[0]}")/load_runner_config.sh" tuning
+
+
 
 # Find a Python interpreter with PyTorch. This lets the script run directly
 # from Git Bash or Linux without requiring manual Conda activation first.
@@ -83,31 +84,8 @@ if [[ -z "${PYTHON_BIN}" ]]; then
   echo "Set PYTHON_BIN explicitly or install/activate the '${CONDA_ENV}' Conda environment." >&2
   exit 1
 fi
-EPOCHS="${EPOCHS:-50}"
-FOLDS="${FOLDS:-10}"
-SEEDS="${SEEDS:-42}"
-EARLY_STOP="${EARLY_STOP:-10}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-tuning}"
-MP_LAYER="${MP_LAYER:-graphconv}"
-HIDDEN="${HIDDEN:-32}"
-POOLING_RATIO="${POOLING_RATIO:-0.5}"
-
-datasets=(
-  "AIDS"
-  "BZR"
-  "COX2"
-  "DD"
-  "DHFR"
-  "ENZYMES"
-  "IMDB-BINARY"
-  "MSRC_21"
-  "MSRC_9"
-  "MUTAG"
-  "PTC_MR"
-  "Synthie"
-)
-# Node-clustering methods included in the tuning workflow.
-models=("gaus" "unif" "count1" "count2" "count4" "ndrp")
+datasets=()
+models=()
 
 # Optional comma-separated command-line overrides, for example:
 # DATASETS=DD MODELS=gaus,unif bash run_hyperparameter_tuning.sh
@@ -118,28 +96,23 @@ if [[ -n "${MODELS:-}" ]]; then
   IFS=',' read -r -a models <<< "${MODELS}"
 fi
 
-# Coordinate-search candidates: 6 + 4 + 3 + 4 = 17 per model-dataset pair.
-learning_rates=(0.01 0.05 0.001 0.005 0.0001 0.0005)
-weight_decays=(0.01 0.001 0.0001 0.00001)
-dropouts=(0.0 0.2 0.5)
-batch_sizes=(32 64 128 256)
+if [[ ${#datasets[@]} -eq 0 || ${#models[@]} -eq 0 ]]; then
+  echo "Tuning requires nonempty datasets and models in the config." >&2
+  exit 1
+fi
 
 # Set QUICK_TEST=1 to run one candidate per model-dataset pair while checking
 # output paths. The normal coordinate-search arrays above remain unchanged.
-QUICK_TEST="${QUICK_TEST:-0}"
+
 if [[ "${QUICK_TEST}" == "1" ]]; then
   # The shortest path test uses only the first method and one configuration.
-  if [[ -z "${MODELS:-}" ]]; then
-    models=("gaus")
+  if [[ -z "${quick_test_models_override}" ]]; then
+    models=("${models[0]}")
   fi
-  learning_rates=(0.001)
-  weight_decays=(0.0001)
-  dropouts=(0.2)
-  batch_sizes=(128)
 fi
 
 # Set USE_CUDA=1 to append --cuda to every run.
-USE_CUDA="${USE_CUDA:-0}"
+
 
 tuning_root="results/hyperparameter_tuning"
 experiment_directory="${tuning_root}/${EXPERIMENT_NAME}"
@@ -327,10 +300,10 @@ select_stage() {
 
 for dataset in "${datasets[@]}"; do
   for model in "${models[@]}"; do
-    selected_lr="0.001"
-    selected_weight_decay="0.0001"
-    selected_dropout="0.2"
-    selected_batch_size="128"
+    selected_lr="${LEARNING_RATE}"
+    selected_weight_decay="${WEIGHT_DECAY}"
+    selected_dropout="${DROPOUT}"
+    selected_batch_size="${BATCH_SIZE}"
 
     stage_summary_file="${candidate_directory}/${EXPERIMENT_NAME}_candidates_${dataset}_${model}.csv"
     if [[ ! -f "${stage_summary_file}" ]]; then

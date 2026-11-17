@@ -1,0 +1,82 @@
+{
+  "experiments": {
+    "experiment_name": "default_hyperparameters",
+    "conda_env": "rw-env",
+    "conda_exe": "",
+    "python_bin": "",
+    "datasets": [
+      "MUTAG"
+    ],
+    "models": [
+      "ndrp"
+    ]
+  },
+  "tuning": {
+    "experiment_name": "hyperparameter_tuning",
+    "conda_env": "rw-env",
+    "conda_exe": "",
+    "python_bin": "",
+    "epochs": 50,
+    "folds": 10,
+    "seeds": [
+      42
+    ],
+    "early_stop": 10,
+    "mp_layer": "graphconv",
+    "hidden": 32,
+    "pooling_ratio": 0.5,
+    "use_cuda": false,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "dropout": 0.2,
+    "batch_size": 128,
+    "datasets": [
+      "AIDS",
+      "BZR",
+      "COX2",
+      "DD",
+      "DHFR",
+      "ENZYMES",
+      "IMDB-BINARY",
+      "MSRC_21",
+      "MSRC_9",
+      "MUTAG",
+      "PTC_MR",
+      "Synthie"
+    ],
+    "models": [
+      "gaus",
+      "unif",
+      "count1",
+      "count2",
+      "count4",
+      "ndrp"
+    ],
+    "quick_test": false,
+    "learning_rates": [
+      0.01,
+      0.05,
+      0.001,
+      0.005,
+      0.0001,
+      0.0005
+    ],
+    "weight_decays": [
+      0.01,
+      0.001,
+      0.0001,
+      0.00001
+    ],
+    "dropouts": [
+      0,
+      0.2,
+      0.5
+    ],
+    "batch_sizes": [
+      32,
+      64,
+      128,
+      256
+    ]
+  }
+}
