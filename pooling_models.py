@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch.nn import Parameter
 from torch_geometric.nn import (
     DenseGCNConv,
+    DenseGraphConv,
     DMoNPooling,
     GCNConv,
     GraphConv,
@@ -37,12 +38,14 @@ from torch_scatter import scatter, scatter_add, scatter_max, scatter_min
 from torch_sparse import SparseTensor, coalesce, transpose
 
 
-def make_message_passing_layer(mp_layer, input_dim, output_dim):
-    """Create the selected sparse message-passing layer."""
+def make_message_passing_layer(mp_layer, input_dim, output_dim, dense=False):
+    """Create the selected sparse or dense message-passing layer."""
     if mp_layer == "gcn":
-        return GCNConv(input_dim, output_dim)
+        convolution = DenseGCNConv if dense else GCNConv
+        return convolution(input_dim, output_dim)
     if mp_layer == "graphconv":
-        return GraphConv(input_dim, output_dim)
+        convolution = DenseGraphConv if dense else GraphConv
+        return convolution(input_dim, output_dim)
     raise ValueError("mp_layer must be 'gcn' or 'graphconv'")
 
 
@@ -1343,12 +1346,17 @@ def dense_just_balance_pool(x, adj, s, mask=None):
 class DensePoolingStage(nn.Module):
     """One dense pooling stage for paper and baseline methods."""
 
-    def __init__(self, hidden: int, num_clusters: int, model: str, pratio: float):
+    def __init__(
+        self, hidden: int, num_clusters: int, model: str, pratio: float,
+        mp_layer: str = "graphconv",
+    ):
         super().__init__()
         self.model = model
         self.pratio = pratio
         self.num_clusters = num_clusters
-        self.assignment = DenseGCNConv(hidden, num_clusters)
+        self.assignment = make_message_passing_layer(
+            mp_layer, hidden, num_clusters, dense=True
+        )
         self.dmon = DMoNPooling([hidden, hidden], num_clusters) if model == "dmon" else None
 
     def forward(self, x, adj, mask):
@@ -1538,6 +1546,7 @@ class DensePool(nn.Module):
         dropout: float = 0.2,
         max_nodes: int = 500,
         output_dim=None,
+        mp_layer: str = "graphconv",
     ):
         super().__init__()
 
@@ -1560,12 +1569,15 @@ class DensePool(nn.Module):
             num_clusters = max(1, int(round(pratio * max_nodes)))
             second_num_clusters = max(1, int(round(pratio * num_clusters)))
         self.max_nodes = max_nodes
-        self.conv1 = DenseGCNConv(input_dim, hidden)
-        self.conv2 = DenseGCNConv(hidden, hidden)
-        self.conv3 = DenseGCNConv(hidden, hidden)
-        self.pool1 = DensePoolingStage(hidden, num_clusters, model, pratio)
+        self.mp_layer = mp_layer
+        self.conv1 = make_message_passing_layer(mp_layer, input_dim, hidden, dense=True)
+        self.conv2 = make_message_passing_layer(mp_layer, hidden, hidden, dense=True)
+        self.conv3 = make_message_passing_layer(mp_layer, hidden, hidden, dense=True)
+        self.pool1 = DensePoolingStage(
+            hidden, num_clusters, model, pratio, mp_layer=mp_layer
+        )
         self.pool2 = DensePoolingStage(
-            hidden, second_num_clusters, model, pratio
+            hidden, second_num_clusters, model, pratio, mp_layer=mp_layer
         )
         self.dropout = nn.Dropout(dropout)
         self.classifier = nn.Linear(

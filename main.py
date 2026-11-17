@@ -387,6 +387,7 @@ def main(
                 pratio=pratio,
                 dropout=dropout,
                 max_nodes=max_nodes,
+                mp_layer=mp_layer,
                 output_dim=target_dim if task_type == "regression" else None,
             ).to(device)
         elif model_name in {"count1", "count2", "count4"}:
@@ -888,7 +889,7 @@ if __name__ == "__main__":
         "--mp-layer",
         choices=("gcn", "graphconv"),
         default="graphconv",
-        help="Sparse message-passing layer used by all sparse models.",
+        help="Message-passing layer for sparse models and its dense counterpart for dense models.",
     )
     parser.add_argument(
         "--k_folds",
