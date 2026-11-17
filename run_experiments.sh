@@ -2,7 +2,17 @@
 
 set -euo pipefail
 
-source "$(dirname -- "${BASH_SOURCE[0]}")/load_runner_config.sh" experiments
+if [[ $# -eq 0 ]]; then
+  source "$(dirname -- "${BASH_SOURCE[0]}")/load_runner_config.sh" experiments count
+  for ((experiment_index = 0; experiment_index < EXPERIMENT_COUNT; experiment_index++)); do
+    echo "Starting experiment $((experiment_index + 1))/${EXPERIMENT_COUNT}"
+    bash "${BASH_SOURCE[0]}" "${experiment_index}"
+  done
+  echo "All ${EXPERIMENT_COUNT} queued experiments completed."
+  exit 0
+fi
+
+source "$(dirname -- "${BASH_SOURCE[0]}")/load_runner_config.sh" experiments "$1"
 
 # Find a Python interpreter with PyTorch, activating Conda when necessary.
 python_has_torch() {

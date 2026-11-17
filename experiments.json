@@ -1,16 +1,32 @@
 {
-  "experiments": {
-    "experiment_name": "default_hyperparameters",
-    "conda_env": "rw-env",
-    "conda_exe": "",
-    "python_bin": "",
-    "datasets": [
-      "FreeSolv"
-    ],
-    "models": [
-      "topk"
-    ]
-  },
+  "experiments": [
+    {
+      "experiment_name": "default_hyperparameters_gcn",
+      "conda_env": "rw-env",
+      "conda_exe": "",
+      "python_bin": "",
+      "mp_layer": "gcn",
+      "datasets": [
+        "PROTEINS"
+      ],
+      "models": [
+        "diff"
+      ]
+    },
+    {
+      "experiment_name": "default_hyperparameters_graphconv",
+      "conda_env": "rw-env",
+      "conda_exe": "",
+      "python_bin": "",
+      "mp_layer": "graphconv",
+      "datasets": [
+        "PROTEINS"
+      ],
+      "models": [
+        "diff"
+      ]
+    }
+  ],
   "tuning": {
     "experiment_name": "hyperparameter_tuning",
     "conda_env": "rw-env",

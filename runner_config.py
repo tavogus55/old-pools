@@ -5,14 +5,32 @@ import shlex
 import sys
 
 
-def load_config(filename, profile):
+def load_config(filename, profile, selection=None):
     with open(filename, encoding="utf-8-sig") as handle:
         config = json.load(handle)
     if not isinstance(config, dict) or set(config) - {"experiments", "tuning"}:
         raise ValueError("expected independent experiments and tuning JSON objects")
-    if not isinstance(config.get(profile), dict):
-        raise ValueError("{} must be a JSON object".format(profile))
     settings = config[profile]
+    if profile == "experiments":
+        experiments = settings if isinstance(settings, list) else [settings]
+        if not experiments:
+            raise ValueError("experiments must contain at least one experiment")
+        commands = [settings_commands(item, profile) for item in experiments]
+        names = [item["experiment_name"] for item in experiments]
+        if len(set(names)) != len(names):
+            raise ValueError("experiments must have unique experiment_name values")
+        if selection == "count":
+            return "EXPERIMENT_COUNT={}".format(len(experiments))
+        index = 0 if not selection else int(selection)
+        if not 0 <= index < len(experiments):
+            raise ValueError("experiment index out of range: {}".format(index))
+        return commands[index]
+    return settings_commands(settings, profile)
+
+
+def settings_commands(settings, profile):
+    if not isinstance(settings, dict):
+        raise ValueError("each {} entry must be a JSON object".format(profile))
     strings = {"experiment_name", "conda_env", "conda_exe", "python_bin", "mp_layer"}
     integers = {"epochs", "folds", "early_stop", "hidden", "batch_size"}
     numbers = {"learning_rate", "weight_decay", "dropout", "pooling_ratio"}
@@ -35,6 +53,8 @@ def load_config(filename, profile):
             valid = isinstance(value, str) and not any(character in value for character in "\r\n\0")
             if key in {"experiment_name", "conda_env", "mp_layer"}:
                 valid = valid and bool(value)
+            if key == "mp_layer":
+                valid = valid and value in {"gcn", "graphconv"}
         elif key in integers:
             valid = type(value) is int and value > 0
             if key == "folds":
@@ -78,6 +98,6 @@ def load_config(filename, profile):
 
 if __name__ == "__main__":
     try:
-        print(load_config(sys.argv[1], sys.argv[2]))
-    except (OSError, ValueError, TypeError) as error:
+        print(load_config(sys.argv[1], sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None))
+    except (OSError, ValueError, TypeError, KeyError) as error:
         sys.exit("Could not load runner config: {}".format(error))

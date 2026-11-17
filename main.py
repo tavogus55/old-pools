@@ -13,6 +13,7 @@ from torch_geometric.loader import DataLoader, DenseDataLoader
 from torch_geometric.transforms import ToDense
 
 from dataset_loader import CSVMoleculeDataset, prepare_qm7b_graph, scalar_edge_weight
+from pooling_adapters import prepare_sep_dataset
 from pooling_models import CountSketchPooling, DensePool, sparse_pooling
 from utils import get_logger, log_experiment_settings, save_to_csv
 
@@ -82,11 +83,17 @@ def forward_model(model, batch, device, is_dense):
         # all message-passing layers operate on floating-point features.
         x = batch.x.float()
 
+    pool_kwargs = {}
+    if getattr(model, "model", None) == "sep":
+        pool_kwargs["pool_assignments"] = (
+            batch.sep_assignment1, batch.sep_assignment2
+        )
     return model(
         x,
         batch.edge_index,
         batch.batch,
         edge_weight=scalar_edge_weight(batch),
+        **pool_kwargs,
     )
 
 
@@ -228,9 +235,15 @@ def main(
         "dmon",
         "hosc",
         "justb",
+        "asym",
     }
     if model_name == "diff":
         logger.info("DiffPool variant: degree-normalized pooled adjacency; pooled self-loops retained")
+    if model_name == "asym":
+        logger.info(
+            "AsymCheegerCut: original MLP assignments; unused auxiliary "
+            "diagnostics disabled for the pipeline's task-only objective"
+        )
     # Apply the same graph-size limit to every model so sparse and dense
     # methods process exactly the same dataset and cross-validation splits.
     max_nodes = DENSE_MAX_NODES[dataset_name]
@@ -248,6 +261,12 @@ def main(
         f"Max-node filter: kept {len(dataset)}/{original_graph_count} graphs "
         f"with at most {max_nodes} nodes"
     )
+
+    if model_name == "sep":
+        dataset = prepare_sep_dataset(
+            dataset, data_dir / "sep_trees" / f"{dataset_name}_depth3_v1.pt"
+        )
+        logger.info("SEP: precomputed original depth-three coding trees; ratio is structural")
 
     # Save the filtered dataset used by the experiment.
     torch.save(dataset, output_path)
@@ -840,11 +859,13 @@ if __name__ == "__main__":
             "gsap",
             "hgpsl",
             "pars",
+            "sep",
             "diff",
             "mincut",
             "dmon",
             "hosc",
             "justb",
+            "asym",
             "gaus",
             "unif",
             "count1",

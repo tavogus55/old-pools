@@ -14,5 +14,5 @@ if [[ -z "${config_python}" ]]; then
   echo "Python is required to read experiments.json; set PYTHON_BIN to a Python interpreter." >&2
   exit 1
 fi
-config_values="$("${config_python}" "${runner_directory}/runner_config.py" "${CONFIG_FILE:-${runner_directory}/experiments.json}" "$1")" || exit 1
+config_values="$("${config_python}" "${runner_directory}/runner_config.py" "${CONFIG_FILE:-${runner_directory}/experiments.json}" "$1" "${2:-}")" || exit 1
 eval "${config_values}"

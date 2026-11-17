@@ -27,7 +27,6 @@ from torch_geometric.utils import (
     add_remaining_self_loops,
     add_self_loops,
     dense_to_sparse,
-    remove_self_loops as torch_geometric_remove_self_loops,
     subgraph,
     softmax,
     to_dense_adj,
@@ -35,6 +34,8 @@ from torch_geometric.utils import (
 )
 from torch_scatter import scatter, scatter_add, scatter_max, scatter_min
 from torch_sparse import SparseTensor, coalesce, transpose
+
+from pooling_adapters import AsymCheegerCutAdapter, ParsPooling, SEPPooling
 
 
 def make_message_passing_layer(mp_layer, input_dim, output_dim, dense=False):
@@ -92,175 +93,6 @@ def sample_countsketch_rows(p_node, q):
     return rows, valid, q_node
 
 
-class _ParsingMLP(nn.Module):
-    """Small edge-scoring MLP used by the Graph Parsing Network parser."""
-
-    def __init__(self, channels, num_layers=2, dropout=0.0):
-        super().__init__()
-        layers = []
-        if num_layers <= 1:
-            layers.append(nn.Linear(channels, 1))
-        else:
-            layers.append(nn.Linear(channels, channels))
-            for _ in range(num_layers - 2):
-                layers.extend([nn.LayerNorm(channels), nn.ReLU(), nn.Dropout(dropout)])
-                layers.append(nn.Linear(channels, channels))
-            layers.extend([nn.LayerNorm(channels), nn.ReLU(), nn.Dropout(dropout)])
-            layers.append(nn.Linear(channels, 1))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class ParsPooling(nn.Module):
-    """Graph Parsing Network coarsening adapted to the sparse old-pools API.
-
-    The paper parser learns edge scores, builds dominant-node communities, and
-    returns a sparse node-to-community assignment.  This adapter uses that
-    assignment to compute ``S.T @ X``, gates features by live mean internal-edge
-    scores, and contracts the inter-community sparse edge list.
-    The parser determines the number of communities from graph structure, so
-    ``ratio`` is accepted for interface compatibility but is not used by the
-    original parsing algorithm.
-    """
-
-    def __init__(self, input_dim, ratio=0.5, dropout=0.2):
-        super().__init__()
-        self.ratio = ratio
-        self.dropout_parsing = dropout
-        self.edge_net = _ParsingMLP(input_dim, num_layers=2, dropout=dropout)
-
-    def forward(self, x, edge_index, edge_attr=None, batch=None):
-        if batch is None:
-            batch = x.new_zeros(x.size(0), dtype=torch.long)
-        num_nodes = x.size(0)
-        device = x.device
-
-        # Remove self-loops before parsing, matching GraphParsingNetworks.
-        edge_index, edge_attr = torch_geometric_remove_self_loops(
-            edge_index, edge_attr
-        )
-        if edge_index.numel() == 0:
-            perm = torch.arange(num_nodes, device=device)
-            return x, edge_index, edge_attr, batch, perm, x.new_ones(num_nodes)
-
-        # Randomly drop parsing edges only while training, as in the paper code.
-        if self.training and self.dropout_parsing > 0:
-            keep = torch.rand(edge_index.size(1), device=device) >= self.dropout_parsing
-            edge_index = edge_index[:, keep]
-            if edge_attr is not None:
-                edge_attr = edge_attr[keep]
-            if edge_index.numel() == 0:
-                perm = torch.arange(num_nodes, device=device)
-                return x, edge_index, edge_attr, batch, perm, x.new_ones(num_nodes)
-
-        row, col = edge_index
-        edge_features = x[row] * x[col]
-        edge_score = torch.sigmoid(self.edge_net(edge_features).view(-1))
-
-        # The paper's parser is deliberately performed on CPU because its
-        # dominant-edge/community loop uses stable sorting and set operations.
-        cpu_edge = edge_index.detach().cpu()
-        cpu_score = edge_score.detach().cpu()
-        cpu_batch = batch.detach().cpu()
-        cpu_row, cpu_col = cpu_edge
-        # PyTorch 1.11 has no stable= argument on torch.argsort.
-        order = torch.sort(cpu_score, descending=True)[1]
-        sorted_edges = cpu_edge[:, order]
-        sorted_scores = cpu_score[order]
-
-        # Select each node's highest-scoring incident edge.
-        best_rank = torch.full((num_nodes,), cpu_edge.size(1), dtype=torch.long)
-        for rank, source in enumerate(sorted_edges[0].tolist()):
-            if best_rank[source] == cpu_edge.size(1):
-                best_rank[source] = rank
-        connected = best_rank < cpu_edge.size(1)
-        connected_nodes = connected.nonzero(as_tuple=False).view(-1)
-        isolated_nodes = (~connected).nonzero(as_tuple=False).view(-1)
-        dominant_edges = sorted_edges[:, best_rank[connected_nodes]]
-        dominant_scores = sorted_scores[best_rank[connected_nodes]]
-        # Use the PyTorch 1.11-compatible sorting form here as well.
-        dominant_order = torch.sort(dominant_scores, descending=True)[1]
-        dominant_edges = dominant_edges[:, dominant_order]
-
-        node_to_comm = torch.full((num_nodes,), -1, dtype=torch.long)
-        next_comm = 0
-        remaining = dominant_edges
-        # ``dominant_edges`` still contains global node IDs, so use the full
-        # global batch vector rather than a connected-node-local batch vector.
-        connected_batch = cpu_batch
-
-        # Reproduce the paper's iterative dominant-edge parsing logic.
-        while remaining.size(1):
-            first_by_graph = []
-            for graph_id in connected_batch[remaining[0]].unique().tolist():
-                candidates = (connected_batch[remaining[0]] == graph_id).nonzero().view(-1)
-                first_by_graph.append(candidates[0])
-            node_set = remaining[:, torch.stack(first_by_graph)].unique()
-            while True:
-                subset_mask = torch.isin(remaining[1], node_set)
-                subset = torch.cat([remaining[0][subset_mask], node_set]).unique()
-                graph_ids = connected_batch[subset].unique()
-                graph_comm = torch.full((int(cpu_batch.max().item()) + 1,), -1, dtype=torch.long)
-                graph_comm[graph_ids] = torch.arange(graph_ids.numel()) + next_comm
-                remaining = remaining[:, ~subset_mask]
-                node_to_comm[subset] = graph_comm[connected_batch[subset]]
-                if subset.numel() <= node_set.numel():
-                    next_comm = int(node_to_comm.max().item()) + 1
-                    break
-                node_set = subset
-
-        # Isolated nodes remain singleton communities.
-        node_to_comm[isolated_nodes] = next_comm + torch.arange(isolated_nodes.numel())
-        num_communities = int(node_to_comm.max().item()) + 1
-
-        node_to_comm = node_to_comm.to(device)
-        assignment = SparseTensor(
-            row=torch.arange(num_nodes, device=device),
-            col=node_to_comm,
-            sparse_sizes=(num_nodes, num_communities),
-        )
-
-        # Pool features through the same sparse assignment matrix S.T @ X.
-        pooled_x = assignment.t() @ x
-        internal = node_to_comm[row] == node_to_comm[col]
-        community = node_to_comm[row[internal]]
-        score_sum = scatter_add(
-            edge_score[internal], community, dim=0, dim_size=num_communities
-        )
-        score_count = scatter_add(
-            x.new_ones(community.numel()), community, dim=0,
-            dim_size=num_communities,
-        )
-        community_score = torch.where(
-            score_count > 0, score_sum / score_count.clamp_min(1),
-            torch.ones_like(score_sum),
-        )
-        pooled_x = pooled_x * community_score.unsqueeze(-1)
-        pooled_batch = scatter_min(batch, node_to_comm, dim=0)[0]
-
-        # Contract the original sparse graph and merge duplicate community edges.
-        pooled_edges = torch.stack(
-            [node_to_comm[edge_index[0]], node_to_comm[edge_index[1]]], dim=0
-        )
-        pooled_adj = torch.sparse_coo_tensor(
-            pooled_edges[:, ~internal],
-            x.new_ones(pooled_edges.size(1))[~internal]
-            if edge_attr is None else edge_attr[~internal],
-            (num_communities, num_communities),
-            device=device,
-        ).coalesce()
-        pooled_edge_index = pooled_adj.indices()
-        pooled_edge_weight = None if edge_attr is None else pooled_adj.values()
-        return (
-            pooled_x,
-            pooled_edge_index,
-            pooled_edge_weight,
-            pooled_batch,
-            None,
-            x.new_ones(num_communities),
-        )
 
 
 def countsketch_pool(
@@ -1021,11 +853,11 @@ class SparsePooling(nn.Module):
 
         if model not in {
             "sag", "topk", "ndrp", "ndp", "graclus", "asapool", "pan", "cop",
-            "cgi", "kmis", "gsap", "hgpsl", "pars"
+            "cgi", "kmis", "gsap", "hgpsl", "pars", "sep"
         }:
             raise ValueError(
                 "model must be one of 'sag', 'topk', 'ndrp', 'ndp', "
-                "'graclus', 'asapool', 'pan', 'cop', 'cgi', 'kmis', 'gsap', 'hgpsl', or 'pars'"
+                "'graclus', 'asapool', 'pan', 'cop', 'cgi', 'kmis', 'gsap', 'hgpsl', 'pars', or 'sep'"
             )
 
         self.conv1 = make_message_passing_layer(mp_layer, input_dim, hidden)
@@ -1065,9 +897,11 @@ class SparsePooling(nn.Module):
             pooling_layer = lambda channels, ratio: HGPSLPool(
                 channels, ratio=ratio
             )
+        elif model == "sep":
+            pooling_layer = SEPPooling
         elif model == "pars":
             pooling_layer = lambda channels, ratio: ParsPooling(
-                channels, ratio=ratio
+                channels, ratio=ratio, dropout=dropout
             )
         else:
             pooling_layer = NDPPooling
@@ -1084,18 +918,18 @@ class SparsePooling(nn.Module):
         self._pool_events = []
         self._pool_cpu_time = 0.0
 
-    def _timed_pool(self, pool, x, edge_index, batch, edge_weight=None):
+    def _timed_pool(self, pool, x, edge_index, batch, edge_weight=None, **kwargs):
         if x.is_cuda:
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
             start_event.record()
-            result = pool(x, edge_index, edge_attr=edge_weight, batch=batch)
+            result = pool(x, edge_index, edge_attr=edge_weight, batch=batch, **kwargs)
             end_event.record()
             self._pool_events.append((start_event, end_event))
             return result
 
         pool_start = time.perf_counter()
-        result = pool(x, edge_index, edge_attr=edge_weight, batch=batch)
+        result = pool(x, edge_index, edge_attr=edge_weight, batch=batch, **kwargs)
         self._pool_cpu_time += time.perf_counter() - pool_start
         return result
 
@@ -1118,7 +952,9 @@ class SparsePooling(nn.Module):
         self._pool_cpu_time = 0.0
         self.last_pool_time = 0.0
 
-    def forward(self, x, edge_index, batch, edge_weight=None):
+    def forward(self, x, edge_index, batch, edge_weight=None, pool_assignments=None):
+        if self.model == "sep" and pool_assignments is None:
+            raise ValueError("SEP requires prepare_sep_dataset before batching")
         # GCNConv: input_dim -> 32
         x = self.conv1(x, edge_index, edge_weight)
 
@@ -1130,7 +966,8 @@ class SparsePooling(nn.Module):
 
         # Pooling: ratio = 0.5
         x, edge_index, edge_weight, batch, _, _ = self._timed_pool(
-            self.pool1, x, edge_index, batch, edge_weight
+            self.pool1, x, edge_index, batch, edge_weight,
+            **({"assignment": pool_assignments[0]} if self.model == "sep" else {}),
         )
 
         # GCNConv: 32 -> 32
@@ -1144,7 +981,8 @@ class SparsePooling(nn.Module):
 
         # Pooling: ratio = 0.5
         x, edge_index, edge_weight, batch, _, _ = self._timed_pool(
-            self.pool2, x, edge_index, batch, edge_weight
+            self.pool2, x, edge_index, batch, edge_weight,
+            **({"assignment": pool_assignments[1]} if self.model == "sep" else {}),
         )
 
         # GCNConv: 32 -> 32
@@ -1457,6 +1295,10 @@ class DensePoolingStage(nn.Module):
         self.assignment = make_message_passing_layer(
             mp_layer, hidden, num_clusters, dense=True
         )
+        self.asym = (
+            AsymCheegerCutAdapter(hidden, num_clusters, compute_auxiliary_loss=False)
+            if model == "asym" else None
+        )
         self.dmon = StableDMoNPooling([hidden, hidden], num_clusters) if model == "dmon" else None
 
     def forward(self, x, adj, mask):
@@ -1469,6 +1311,13 @@ class DensePoolingStage(nn.Module):
             )
             pooled_mask = x.new_ones(x.size(0), x.size(1), dtype=torch.bool)
             return x, adj, pooled_mask, x.new_zeros(())
+
+        if self.model == "asym":
+            pooled_x, pooled_adj, tv_loss, balance_loss = self.asym(x, adj, mask)
+            pooled_mask = pooled_x.new_ones(
+                pooled_x.size(0), pooled_x.size(1), dtype=torch.bool
+            )
+            return pooled_x, pooled_adj, pooled_mask, tv_loss + balance_loss
 
         if self.model == "dmon":
             _, pooled_x, pooled_adj, spectral_loss, ortho_loss, cluster_loss = self.dmon(
@@ -1654,12 +1503,12 @@ class DensePool(nn.Module):
         dense_models = {
             "diff", "mincut", "gaus", "unif",
             "count1", "count2", "count4",
-            "dmon", "hosc", "justb",
+            "dmon", "hosc", "justb", "asym",
         }
         if model not in dense_models:
             raise ValueError(
                 "model must be one of diff, mincut, gaus, unif, "
-                "count1, count2, count4, dmon, hosc, or justb"
+                "count1, count2, count4, dmon, hosc, justb, or asym"
             )
 
         if model == "dmon":

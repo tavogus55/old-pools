@@ -16,7 +16,7 @@ python main.py --dataset DD --model topk --epochs 20
 
 Edit `experiments.json` to configure both Bash runners (Git Bash on Windows, or Bash on Linux). The two sections are independent: there is no shared configuration or experiment name.
 
-- `experiments` configures the **default-hyperparameter baseline** run by `run_experiments.sh`. It contains its own experiment name, runtime settings, datasets, and models. Training settings are intentionally omitted, so `main.py`'s argparse defaults are used directly, without duplicating them in JSON or Bash.
+- `experiments` is an **ordered list of default-hyperparameter experiments** run by `run_experiments.sh`. Each entry has its own unique experiment name, runtime settings, datasets, and models. All dataset/model pairs in one entry finish before the next entry starts. The queue stops if any training run fails. A single JSON object is still supported for older configurations.
 - `tuning` configures the **separate hyperparameter-search experiment** run by `run_hyperparameter_tuning.sh`. It has its own experiment name, runtime settings, datasets/models, training budget, initial hyperparameters, and coordinate-search candidate lists. Changing this section cannot change baseline settings.
 
 ```bash
@@ -24,9 +24,11 @@ bash run_experiments.sh
 bash run_hyperparameter_tuning.sh
 ```
 
-Baseline results go to `results/<experiments.experiment_name>.csv`. Tuning artifacts go to `results/hyperparameter_tuning/<tuning.experiment_name>/`. The baseline runner does not load tuning manifests or selected hyperparameters.
+The supplied queue runs `default_hyperparameters_gcn` with `"mp_layer": "gcn"`, then `default_hyperparameters_graphconv` with `"mp_layer": "graphconv"`. Both use PROTEINS and DiffPool, with all other training settings left at `main.py` defaults. Copy an entry to add experiments, and reorder the list to change execution order. Omitted settings never carry over from the previous experiment.
 
-To deliberately override an argparse default for a baseline run, add only that non-default setting to `experiments` (for example, `"epochs": 100` or `"seeds": [42]`); otherwise leave it out. Supported optional settings are `epochs`, `folds`, `seeds`, `early_stop`, `mp_layer`, `hidden`, `pooling_ratio`, `learning_rate`, `weight_decay`, `dropout`, `batch_size`, and `use_cuda`.
+Baseline results go to `results/<experiment_name>.csv` for each entry, keeping the backbone runs separate. Tuning artifacts go to `results/hyperparameter_tuning/<tuning.experiment_name>/`. The baseline runner does not load tuning manifests or selected hyperparameters.
+
+To deliberately override an argparse default for a baseline run, add only that non-default setting to the relevant `experiments` entry (for example, `"epochs": 100` or `"seeds": [42]`); otherwise leave it out. Supported optional settings are `epochs`, `folds`, `seeds`, `early_stop`, `mp_layer`, `hidden`, `pooling_ratio`, `learning_rate`, `weight_decay`, `dropout`, `batch_size`, and `use_cuda`.
 
 Tuning starts each coordinate search from its own configured scalar hyperparameters. `quick_test: true` runs one candidate and final retraining per dataset using the first configured model; an explicit `MODELS` environment override retains all supplied models. Both sections require nonempty dataset/model lists.
 
@@ -150,6 +152,8 @@ Regression datasets use MSE, RMSE, and MAE rather than classification accuracy a
 | `justb` | JustBalance pooling | Node clustering |
 | `graclus` | Graclus pooling | Node clustering |
 | `pars` | Graph parsing pooling | Node clustering |
+| `asym` | Asymmetric Cheeger cut pooling | Node clustering |
+| `sep` | Structural Entropy Pooling (SEP-G) | Node clustering |
 | `gaus` | Gaussian random projection pooling | Node clustering |
 | `unif` | Uniform random projection pooling | Node clustering |
 | `count1` | Sparse CountSketch, q=1 | Node clustering |
@@ -157,6 +161,35 @@ Regression datasets use MSE, RMSE, and MAE rather than classification accuracy a
 | `count4` | Sparse CountSketch, q=4 | Node clustering |
 
 `count1`, `count2`, and `count4` use the sparse CountSketch command-line path. Gaussian and Uniform use their dense pooled representation, with sparse graph input where supported by the current hybrid implementation.
+
+### Original Asym, PARS, and SEP implementations
+
+`asym`, `pars`, and `sep` work with the same CLI, runners, classification and
+single-/multi-target regression heads, evaluation metrics, and both message-passing
+backbones. Install SEP's additional preprocessing dependencies into the existing
+PyTorch/PyG environment:
+
+```powershell
+python -m pip install -r requirements-pooling.txt
+python main.py --dataset PROTEINS --model asym --epochs 20 --exp_name pooling_classification
+python main.py --dataset FreeSolv --model pars --epochs 20 --exp_name pooling_regression
+python main.py --dataset FreeSolv --model sep --epochs 20 --exp_name pooling_regression
+```
+
+SEP builds the original depth-three coding trees once during preprocessing and
+caches topology-only assignments under `data/sep_trees/`, not inside each batch.
+PARS and SEP choose cluster counts structurally, so `--pratio` does not change
+their algorithms. Asym follows the usual two-stage ratio schedule. The pipeline
+retains its task-only training objective; Asym skips unused auxiliary diagnostics
+for runtime parity, while the standalone original losses remain available.
+
+The former local PARS approximation is replaced by the author's parser, including
+undirected dropout and original community-score/link-count gating. Do not mix
+its old and new results as identical configurations. See
+[source provenance and exact integration semantics](pooling_originals/README.md)
+and [correctness checks and measured runtimes](docs/pooling_validation.md).
+Keep classification and regression under separate experiment names because the
+existing summary-CSV writer uses different metric schemas for the two tasks.
 
 ## Dataset-size filtering
 
