@@ -19,7 +19,6 @@ from torch_geometric.nn import (
     global_max_pool,
     global_mean_pool,
     dense_diff_pool,
-    dense_mincut_pool,
 )
 from torch_geometric.nn.conv import MessagePassing
 from torch_geometric.nn.conv.gcn_conv import gcn_norm
@@ -119,7 +118,8 @@ class ParsPooling(nn.Module):
 
     The paper parser learns edge scores, builds dominant-node communities, and
     returns a sparse node-to-community assignment.  This adapter uses that
-    assignment to compute ``S.T @ X`` and contracts the sparse edge list.
+    assignment to compute ``S.T @ X``, gates features by live mean internal-edge
+    scores, and contracts the inter-community sparse edge list.
     The parser determines the number of communities from graph structure, so
     ``ratio`` is accepted for interface compatibility but is not used by the
     original parsing algorithm.
@@ -224,6 +224,20 @@ class ParsPooling(nn.Module):
 
         # Pool features through the same sparse assignment matrix S.T @ X.
         pooled_x = assignment.t() @ x
+        internal = node_to_comm[row] == node_to_comm[col]
+        community = node_to_comm[row[internal]]
+        score_sum = scatter_add(
+            edge_score[internal], community, dim=0, dim_size=num_communities
+        )
+        score_count = scatter_add(
+            x.new_ones(community.numel()), community, dim=0,
+            dim_size=num_communities,
+        )
+        community_score = torch.where(
+            score_count > 0, score_sum / score_count.clamp_min(1),
+            torch.ones_like(score_sum),
+        )
+        pooled_x = pooled_x * community_score.unsqueeze(-1)
         pooled_batch = scatter_min(batch, node_to_comm, dim=0)[0]
 
         # Contract the original sparse graph and merge duplicate community edges.
@@ -231,13 +245,14 @@ class ParsPooling(nn.Module):
             [node_to_comm[edge_index[0]], node_to_comm[edge_index[1]]], dim=0
         )
         pooled_adj = torch.sparse_coo_tensor(
-            pooled_edges,
-            x.new_ones(pooled_edges.size(1)),
+            pooled_edges[:, ~internal],
+            x.new_ones(pooled_edges.size(1))[~internal]
+            if edge_attr is None else edge_attr[~internal],
             (num_communities, num_communities),
             device=device,
         ).coalesce()
         pooled_edge_index = pooled_adj.indices()
-        pooled_edge_weight = pooled_adj.values()
+        pooled_edge_weight = None if edge_attr is None else pooled_adj.values()
         return (
             pooled_x,
             pooled_edge_index,
@@ -512,19 +527,21 @@ class GraclusPooling(nn.Module):
             )
             pooled_adjacency = torch.sparse_coo_tensor(
                 pooled_edges,
-                x.new_ones(pooled_edges.size(1)),
+                x.new_ones(pooled_edges.size(1)) if edge_attr is None else edge_attr,
                 (num_clusters, num_clusters),
                 device=x.device,
             ).coalesce()
             pooled_edge_index = pooled_adjacency.indices()
+            pooled_edge_weight = None if edge_attr is None else pooled_adjacency.values()
         else:
             pooled_edge_index = edge_index.new_empty((2, 0))
+            pooled_edge_weight = None if edge_attr is None else edge_attr.new_empty(0)
 
         pooled_batch = scatter_min(batch, cluster, dim=0)[0]
         return (
             pooled_x,
             pooled_edge_index,
-            None,
+            pooled_edge_weight,
             pooled_batch,
             None,
             x.new_ones(num_clusters),
@@ -543,9 +560,9 @@ class ASAPoolingAdapter(nn.Module):
             GNN=message_passing,
         )
 
-    def forward(self, x, edge_index, batch=None):
+    def forward(self, x, edge_index, batch=None, edge_attr=None):
         x, edge_index, edge_weight, batch, perm = self.pool(
-            x, edge_index, batch=batch
+            x, edge_index, edge_weight=edge_attr, batch=batch
         )
         return x, edge_index, edge_weight, batch, perm, x.new_ones(x.size(0))
 
@@ -557,9 +574,9 @@ class PANPoolingAdapter(nn.Module):
         super().__init__()
         self.pool = PANPooling(input_dim, ratio=ratio)
 
-    def forward(self, x, edge_index, batch=None):
+    def forward(self, x, edge_index, batch=None, edge_attr=None):
         # PANPooling expects a SparseTensor with explicit unit edge weights.
-        edge_weight = x.new_ones(edge_index.size(1))
+        edge_weight = x.new_ones(edge_index.size(1)) if edge_attr is None else edge_attr
         adjacency = SparseTensor(
             row=edge_index[0],
             col=edge_index[1],
@@ -663,9 +680,9 @@ class CoPoolingInformationScore(MessagePassing):
             edge_index, edge_weight, 0, x.size(0)
         )
         row, col = edge_index
-        degree = scatter_add(edge_weight, row, dim=0, dim_size=x.size(0))
-        degree_inv_sqrt = degree.pow(-0.5)
-        degree_inv_sqrt[degree_inv_sqrt == float("inf")] = 0
+        degree = scatter_add(edge_weight, col, dim=0, dim_size=x.size(0))
+        epsilon = max(EPS, torch.finfo(x.dtype).tiny)
+        degree_inv_sqrt = degree.clamp_min(epsilon).rsqrt()
         expanded_degree = x.new_zeros(edge_weight.size(0))
         expanded_degree[-x.size(0):] = 1
         norm = expanded_degree - (
@@ -727,13 +744,13 @@ class CoPoolingAdapter(nn.Module):
         self.prop.reset_parameters()
         self.graph_attention.init_params()
 
-    def forward(self, x, edge_index, batch=None):
+    def forward(self, x, edge_index, batch=None, edge_attr=None):
         if batch is None:
             batch = edge_index.new_zeros(x.size(0))
         num_nodes = x.size(0)
 
         # Paper step: propagate node features before calculating edge attention.
-        x_cut = self.prop(x, edge_index)
+        x_cut = self.prop(x, edge_index, edge_attr)
 
         # Paper step: calculate one attention value for every input edge.
         attention = self.graph_attention(x_cut, edge_index).sum(dim=1)
@@ -808,14 +825,14 @@ class CGIPool(nn.Module):
         self.positive_pooling = GraphConv(in_channels, 1)
         self.negative_pooling = GraphConv(in_channels, 1)
 
-    def forward(self, x, edge_index, batch=None):
+    def forward(self, x, edge_index, batch=None, edge_attr=None):
         if batch is None:
             batch = x.new_zeros(x.size(0), dtype=torch.long)
-        x_transform = F.leaky_relu(self.transform(x, edge_index), 0.2)
-        x_tp = F.leaky_relu(self.pp_conv(x, edge_index), 0.2)
-        x_tn = F.leaky_relu(self.np_conv(x, edge_index), 0.2)
-        score_positive = self.positive_pooling(x_tp, edge_index).view(-1)
-        score_negative = self.negative_pooling(x_tn, edge_index).view(-1)
+        x_transform = F.leaky_relu(self.transform(x, edge_index, edge_attr), 0.2)
+        x_tp = F.leaky_relu(self.pp_conv(x, edge_index, edge_attr), 0.2)
+        x_tn = F.leaky_relu(self.np_conv(x, edge_index, edge_attr), 0.2)
+        score_positive = self.positive_pooling(x_tp, edge_index, edge_attr).view(-1)
+        score_negative = self.negative_pooling(x_tn, edge_index, edge_attr).view(-1)
         positive = copooling_topk(score_positive, 1, batch)
         negative = copooling_topk(score_negative, 1, batch)
         # The paper uses positive/negative graph readouts for CGI's auxiliary
@@ -826,6 +843,7 @@ class CGIPool(nn.Module):
         pooled_edge_index, pooled_edge_attr = subgraph(
             perm,
             edge_index,
+            edge_attr=edge_attr,
             relabel_nodes=True,
             num_nodes=x.size(0),
         )
@@ -877,7 +895,7 @@ class KMISPool(nn.Module):
         self.k = k
         self.lin = nn.Linear(in_channels, 1)
 
-    def forward(self, x, edge_index, batch=None):
+    def forward(self, x, edge_index, batch=None, edge_attr=None):
         if batch is None:
             batch = x.new_zeros(x.size(0), dtype=torch.long)
         score = self.lin(x).sigmoid().view(-1)
@@ -892,7 +910,7 @@ class KMISPool(nn.Module):
         pooled_edges = torch.stack([cluster[row], cluster[col]], dim=0)
         pooled_adjacency = torch.sparse_coo_tensor(
             pooled_edges,
-            x.new_ones(pooled_edges.size(1)),
+            x.new_ones(pooled_edges.size(1)) if edge_attr is None else edge_attr,
             (num_clusters, num_clusters),
         ).coalesce()
         pooled_edges = pooled_adjacency.indices()
@@ -900,7 +918,8 @@ class KMISPool(nn.Module):
         pooled_edges = pooled_edges[:, keep]
         pooled_x = x[mis] * score[mis].view(-1, 1)
         pooled_batch = batch[mis]
-        return pooled_x, pooled_edges, None, pooled_batch, mis, cluster
+        pooled_weights = None if edge_attr is None else pooled_adjacency.values()[keep]
+        return pooled_x, pooled_edges, pooled_weights, pooled_batch, mis, cluster
 
 
 class GSAPool(nn.Module):
@@ -913,16 +932,17 @@ class GSAPool(nn.Module):
         self.sbtl_layer = GCNConv(in_channels, 1)
         self.fbtl_layer = nn.Linear(in_channels, 1)
 
-    def forward(self, x, edge_index, batch=None):
+    def forward(self, x, edge_index, batch=None, edge_attr=None):
         if batch is None:
             batch = x.new_zeros(x.size(0), dtype=torch.long)
-        score_s = self.sbtl_layer(x, edge_index).view(-1)
+        score_s = self.sbtl_layer(x, edge_index, edge_attr).view(-1)
         score_f = self.fbtl_layer(x).view(-1)
         score = torch.tanh(score_s * self.alpha + score_f * (1 - self.alpha))
         perm = copooling_topk(score, self.ratio, batch)
         pooled_x = x[perm] * score[perm].view(-1, 1)
         pooled_edge_index, pooled_edge_attr = subgraph(
-            perm, edge_index, relabel_nodes=True, num_nodes=x.size(0)
+            perm, edge_index, edge_attr=edge_attr, relabel_nodes=True,
+            num_nodes=x.size(0)
         )
         return pooled_x, pooled_edge_index, pooled_edge_attr, batch[perm], perm, x[perm]
 
@@ -939,17 +959,19 @@ class HGPSLPool(nn.Module):
         nn.init.xavier_uniform_(self.att)
         self.information_score = CoPoolingInformationScore()
 
-    def forward(self, x, edge_index, batch=None):
+    def forward(self, x, edge_index, batch=None, edge_attr=None):
         if batch is None:
             batch = x.new_zeros(x.size(0), dtype=torch.long)
         score = self.information_score(
-            x, edge_index, x.new_ones(edge_index.size(1))
+            x, edge_index,
+            x.new_ones(edge_index.size(1)) if edge_attr is None else edge_attr,
         ).abs().sum(dim=1)
         perm = copooling_topk(score, self.ratio, batch)
         pooled_x = x[perm]
         pooled_batch = batch[perm]
         induced_edge_index, induced_edge_attr = subgraph(
-            perm, edge_index, relabel_nodes=True, num_nodes=x.size(0)
+            perm, edge_index, edge_attr=edge_attr, relabel_nodes=True,
+            num_nodes=x.size(0)
         )
 
         # Paper step: construct the learned link structure and normalize it.
@@ -975,14 +997,14 @@ class HGPSLPool(nn.Module):
         weights = F.leaky_relu(weights, self.negative_slop)
         dense_adj[full_row, full_col] = weights
         induced_row, induced_col = induced_edge_index
-        dense_adj[induced_row, induced_col] += induced_edge_attr * self.lamb
+        dense_adj[induced_col, induced_row] += induced_edge_attr * self.lamb
         weights = dense_adj[full_row, full_col]
         normalized = softmax(weights, full_row, num_nodes=num_nodes)
-        return pooled_x, full_edge_index, normalized, pooled_batch, perm, pooled_x.new_ones(num_nodes)
+        return pooled_x, full_edge_index.flip(0), normalized, pooled_batch, perm, pooled_x.new_ones(num_nodes)
 
 
 class SparsePooling(nn.Module):
-    """GCN classifier with two sparse pooling stages."""
+    """Shared weighted message-passing backbone with two sparse pooling stages."""
 
     def __init__(
         self,
@@ -999,7 +1021,7 @@ class SparsePooling(nn.Module):
 
         if model not in {
             "sag", "topk", "ndrp", "ndp", "graclus", "asapool", "pan", "cop",
-            "cgi", "kmis", "gsap", "hgpsl", "hdpsl", "pars"
+            "cgi", "kmis", "gsap", "hgpsl", "pars"
         }:
             raise ValueError(
                 "model must be one of 'sag', 'topk', 'ndrp', 'ndp', "
@@ -1039,7 +1061,7 @@ class SparsePooling(nn.Module):
             pooling_layer = lambda channels, ratio: GSAPool(
                 channels, pooling_ratio=ratio, alpha=0.4
             )
-        elif model in {"hgpsl", "hdpsl"}:
+        elif model == "hgpsl":
             pooling_layer = lambda channels, ratio: HGPSLPool(
                 channels, ratio=ratio
             )
@@ -1062,18 +1084,18 @@ class SparsePooling(nn.Module):
         self._pool_events = []
         self._pool_cpu_time = 0.0
 
-    def _timed_pool(self, pool, x, edge_index, batch):
+    def _timed_pool(self, pool, x, edge_index, batch, edge_weight=None):
         if x.is_cuda:
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
             start_event.record()
-            result = pool(x, edge_index, batch=batch)
+            result = pool(x, edge_index, edge_attr=edge_weight, batch=batch)
             end_event.record()
             self._pool_events.append((start_event, end_event))
             return result
 
         pool_start = time.perf_counter()
-        result = pool(x, edge_index, batch=batch)
+        result = pool(x, edge_index, edge_attr=edge_weight, batch=batch)
         self._pool_cpu_time += time.perf_counter() - pool_start
         return result
 
@@ -1096,9 +1118,9 @@ class SparsePooling(nn.Module):
         self._pool_cpu_time = 0.0
         self.last_pool_time = 0.0
 
-    def forward(self, x, edge_index, batch):
+    def forward(self, x, edge_index, batch, edge_weight=None):
         # GCNConv: input_dim -> 32
-        x = self.conv1(x, edge_index)
+        x = self.conv1(x, edge_index, edge_weight)
 
         # ReLU
         x = x.relu()
@@ -1107,12 +1129,12 @@ class SparsePooling(nn.Module):
         x = self.dropout(x)
 
         # Pooling: ratio = 0.5
-        x, edge_index, _, batch, _, _ = self._timed_pool(
-            self.pool1, x, edge_index, batch
+        x, edge_index, edge_weight, batch, _, _ = self._timed_pool(
+            self.pool1, x, edge_index, batch, edge_weight
         )
 
         # GCNConv: 32 -> 32
-        x = self.conv2(x, edge_index)
+        x = self.conv2(x, edge_index, edge_weight)
 
         # ReLU
         x = x.relu()
@@ -1121,12 +1143,12 @@ class SparsePooling(nn.Module):
         x = self.dropout(x)
 
         # Pooling: ratio = 0.5
-        x, edge_index, _, batch, _, _ = self._timed_pool(
-            self.pool2, x, edge_index, batch
+        x, edge_index, edge_weight, batch, _, _ = self._timed_pool(
+            self.pool2, x, edge_index, batch, edge_weight
         )
 
         # GCNConv: 32 -> 32
-        x = self.conv3(x, edge_index)
+        x = self.conv3(x, edge_index, edge_weight)
 
         # ReLU
         x = x.relu()
@@ -1281,6 +1303,84 @@ def rank3_trace(x):
     return torch.einsum("ijj->i", x)
 
 
+def normalize_dense_pool_adjacency(adj):
+    """Remove pooled self-loops and normalize without singular gradients."""
+    adj = adj.clone()
+    indices = torch.arange(adj.size(-1), device=adj.device)
+    adj[:, indices, indices] = 0
+    epsilon = max(EPS, torch.finfo(adj.dtype).tiny)
+    degree = adj.sum(dim=-1).clamp_min(epsilon).sqrt().unsqueeze(-1)
+    return (adj / degree) / degree.transpose(1, 2)
+
+
+def normalize_diffpool_adjacency(adj):
+    """Bound DiffPool message scale while retaining its pooled self-loops."""
+    epsilon = max(EPS, torch.finfo(adj.dtype).tiny)
+    degree = adj.abs().sum(dim=-1).clamp_min(epsilon).sqrt().unsqueeze(-1)
+    return (adj / degree) / degree.transpose(1, 2)
+
+
+def dense_pool_orthogonality_loss(s):
+    """Compute the assignment penalty with a safe normalization denominator."""
+    ss = s.transpose(1, 2) @ s
+    identity = torch.eye(s.size(-1), device=s.device, dtype=s.dtype)
+    epsilon = max(EPS, torch.finfo(s.dtype).tiny)
+    return torch.linalg.norm(
+        ss / torch.linalg.norm(ss, dim=(-1, -2), keepdim=True).clamp_min(epsilon)
+        - identity / torch.linalg.norm(identity),
+        dim=(-1, -2),
+    ).mean()
+
+
+def stable_dense_mincut_pool(x, adj, s, mask=None):
+    """MinCut pooling with finite losses and gradients for edgeless graphs."""
+    x = x.unsqueeze(0) if x.dim() == 2 else x
+    adj = adj.unsqueeze(0) if adj.dim() == 2 else adj
+    s = s.unsqueeze(0) if s.dim() == 2 else s
+    s = torch.softmax(s, dim=-1)
+    if mask is not None:
+        valid = mask.reshape(x.size(0), x.size(1), 1).to(x.dtype)
+        x, s = x * valid, s * valid
+    out = s.transpose(1, 2) @ x
+    out_adj = s.transpose(1, 2) @ adj @ s
+    numerator = rank3_trace(out_adj)
+    denominator = (s.square() * adj.sum(dim=-1, keepdim=True)).sum(dim=(1, 2))
+    epsilon = max(EPS, torch.finfo(s.dtype).tiny)
+    mincut_loss = -(numerator / denominator.clamp_min(epsilon)).mean()
+    ortho_loss = dense_pool_orthogonality_loss(s)
+    return out, normalize_dense_pool_adjacency(out_adj), mincut_loss, ortho_loss
+
+
+class StableDMoNPooling(DMoNPooling):
+    """Preserve DMoN's objectives while guarding zero-degree normalization."""
+
+    def forward(self, x, adj, mask=None):
+        x = x.unsqueeze(0) if x.dim() == 2 else x
+        adj = adj.unsqueeze(0) if adj.dim() == 2 else adj
+        s = self.mlp(x)
+        s = F.dropout(s, self.dropout, training=self.training)
+        s = torch.softmax(s, dim=-1)
+        if mask is not None:
+            valid = mask.reshape(x.size(0), x.size(1), 1).to(x.dtype)
+            x, s = x * valid, s * valid
+        out = F.selu(s.transpose(1, 2) @ x)
+        out_adj = s.transpose(1, 2) @ adj @ s
+        degrees = adj.sum(dim=1).transpose(0, 1)
+        epsilon = max(EPS, torch.finfo(s.dtype).tiny)
+        mass = degrees.sum().clamp_min(epsilon)
+        left = s.transpose(1, 2) @ degrees
+        right = degrees.transpose(0, 1) @ s
+        normalizer = (left @ right) / 2 / mass
+        spectral_loss = (-rank3_trace(out_adj - normalizer) / 2 / mass).mean()
+        ortho_loss = dense_pool_orthogonality_loss(s)
+        ss = s.transpose(1, 2) @ s
+        cluster_loss = torch.norm(ss.sum(dim=-1)) / adj.size(1) * s.size(-1) ** 0.5 - 1
+        return (
+            s, out, normalize_dense_pool_adjacency(out_adj),
+            spectral_loss, ortho_loss, cluster_loss,
+        )
+
+
 def dense_hosc_pool(x, adj, s, mask=None, mu=0.5, alpha=0.5):
     """HoscPool from the benchmark paper, used with dense batches."""
     s = torch.softmax(s, dim=-1)
@@ -1357,7 +1457,7 @@ class DensePoolingStage(nn.Module):
         self.assignment = make_message_passing_layer(
             mp_layer, hidden, num_clusters, dense=True
         )
-        self.dmon = DMoNPooling([hidden, hidden], num_clusters) if model == "dmon" else None
+        self.dmon = StableDMoNPooling([hidden, hidden], num_clusters) if model == "dmon" else None
 
     def forward(self, x, adj, mask):
         if self.model in {"gaus", "unif", "count1", "count2", "count4"}:
@@ -1404,8 +1504,9 @@ class DensePoolingStage(nn.Module):
                 x, adj, assignment, mask=mask
             )
             auxiliary_loss = link_loss + entropy_loss
+            adj = normalize_diffpool_adjacency(adj)
         else:
-            x, adj, mincut_loss, orthogonality_loss = dense_mincut_pool(
+            x, adj, mincut_loss, orthogonality_loss = stable_dense_mincut_pool(
                 x, adj, assignment, mask=mask
             )
             auxiliary_loss = mincut_loss + orthogonality_loss
@@ -1622,13 +1723,17 @@ class DensePool(nn.Module):
         self._pool_cpu_time = 0.0
         self.last_pool_time = 0.0
 
-    def forward(self, x, edge_index=None, batch=None, adj=None, mask=None):
+    def forward(
+        self, x, edge_index=None, batch=None, adj=None, mask=None,
+        edge_weight=None,
+    ):
         # Input preparation: use precomputed dense tensors when available.
         if adj is None or mask is None:
             x, mask = to_dense_batch(x, batch, max_num_nodes=self.max_nodes)
             adj = to_dense_adj(
                 edge_index,
                 batch=batch,
+                edge_attr=edge_weight,
                 max_num_nodes=self.max_nodes,
             )
 

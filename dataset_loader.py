@@ -6,6 +6,36 @@ from rdkit import Chem
 from torch_geometric.data import Data, InMemoryDataset
 
 
+def scalar_edge_weight(data):
+    """Return explicit scalar weights without interpreting categorical vectors."""
+    weights = getattr(data, "edge_weight", None)
+    if weights is None:
+        weights = getattr(data, "edge_attr", None)
+    if weights is None:
+        return None
+    if weights.dim() == 2 and weights.size(1) == 1:
+        weights = weights.view(-1)
+    return weights.float() if weights.dim() == 1 else None
+
+
+def prepare_qm7b_graph(data):
+    """Encode Coulomb diagonals as atomic numbers and retain all matrix entries."""
+    graph = data.clone()
+    weights = scalar_edge_weight(graph)
+    if weights is None or not torch.isfinite(weights).all():
+        raise ValueError("QM7b requires finite scalar Coulomb-matrix entries")
+    source, target = graph.edge_index
+    diagonal = weights.new_zeros(graph.num_nodes)
+    loops = source == target
+    diagonal.index_add_(0, source[loops], weights[loops])
+    if not (diagonal > 0).all():
+        raise ValueError("QM7b requires a positive Coulomb diagonal for every atom")
+    graph.x = (2 * diagonal).pow(1 / 2.4).unsqueeze(-1) / 100
+    graph.edge_attr = weights / (diagonal[source].sqrt() * diagonal[target].sqrt())
+    graph.edge_weight = graph.edge_attr
+    return graph
+
+
 class CSVMoleculeDataset(InMemoryDataset):
     """Load a molecular regression dataset from a SMILES CSV file."""
 

@@ -54,7 +54,7 @@ The following are the arguments accepted by `main.py` and their current defaults
 | `--weight_decay`, `--weight-decay` | float | `1e-4` | Adam weight decay. |
 | `--dropout` | float | `0.2` | Dropout probability. |
 | `--batch-size` | integer | `128` | Batch size. |
-| `--mp-layer` | choice | `graphconv` | Sparse message-passing layer: `gcn` or `graphconv`. |
+| `--mp-layer` | choice | `graphconv` | Message-passing family: `graphconv` uses GraphConv / DenseGraphConv; `gcn` uses GCNConv / DenseGCNConv for sparse / dense models. |
 | `--k_folds`, `--k-folds` | integer | `10` | Number of shuffled cross-validation folds. |
 | `--seeds` | one or more strings | `42 43 44 45 46 47 48 49 50 51` | Seeds used for every fold. Comma-separated values are also accepted. |
 | `--log_level` | choice | `info` | Logging level: `debug`, `info`, `warning`, `error`, or `critical`. |
@@ -140,7 +140,6 @@ Regression datasets use MSE, RMSE, and MAE rather than classification accuracy a
 | `kmis` | KMISPool | Node dropping |
 | `gsap` | GSAPool | Node dropping |
 | `hgpsl` | HGPSLPool | Node dropping |
-| `hdpsl` | HDPSLPool | Node dropping |
 | `ndrp` | Node-drop random pooling | Node dropping |
 | `ndp` | Node decimation pooling | Node dropping |
 | **Node Clustering Pooling** |  |  |
@@ -170,6 +169,10 @@ The experiment creates shuffled K-fold splits with a fixed splitter seed of `42`
 ## Metrics and output files
 
 Logs are written under `logs/<exp_name>/`. Results are written to `results/<exp_name>.csv`.
+
+Epoch training loss is weighted by graph count, so a smaller final batch is not overrepresented. Regression training loss uses standardized targets; evaluation metrics use original target units. Training stops with an error before the optimizer update if loss or gradients are nonfinite, and regression evaluation rejects nonfinite MSE. MinCut and DMoN use guarded pooling normalization and auxiliary denominators to support edgeless graphs without NaN gradients.
+
+Scalar input and pooled edge weights are carried through the shared sparse backbone, including HGPSL's learned weights. PARS gates pooled features with differentiable community scores. DiffPool uses degree-normalized pooled adjacency with self-loops retained for both backbone choices; this is an explicit stabilized DiffPool variant, not the unchanged original operator. QM7b uses atomic-number features and dimensionless Coulomb edge weights rather than constant features and binary adjacency. These are graph/model changes, not changes to regression target standardization. See [REGRESSION_FIXES.md](REGRESSION_FIXES.md) for formulas, reasons, proposal boundaries, and validation coverage. Results from before and after these changes must not be pooled as identical configurations.
 
 Classification results include:
 

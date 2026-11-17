@@ -12,7 +12,7 @@ from torch_geometric.datasets import MoleculeNet, QM7b, TUDataset
 from torch_geometric.loader import DataLoader, DenseDataLoader
 from torch_geometric.transforms import ToDense
 
-from dataset_loader import CSVMoleculeDataset
+from dataset_loader import CSVMoleculeDataset, prepare_qm7b_graph, scalar_edge_weight
 from pooling_models import CountSketchPooling, DensePool, sparse_pooling
 from utils import get_logger, log_experiment_settings, save_to_csv
 
@@ -82,20 +82,12 @@ def forward_model(model, batch, device, is_dense):
         # all message-passing layers operate on floating-point features.
         x = batch.x.float()
 
-    # CountSketch accepts optional scalar edge weights; multidimensional TU
-    # edge attributes are not valid scalar weights and therefore default to 1.
-    if isinstance(model, CountSketchPooling):
-        edge_weight = getattr(batch, "edge_attr", None)
-        if edge_weight is not None and edge_weight.dim() != 1:
-            edge_weight = None
-        return model(
-            x,
-            batch.edge_index,
-            batch.batch,
-            edge_weight=edge_weight,
-        )
-
-    return model(x, batch.edge_index, batch.batch)
+    return model(
+        x,
+        batch.edge_index,
+        batch.batch,
+        edge_weight=scalar_edge_weight(batch),
+    )
 
 
 def evaluate_classification(model, loader, device, is_dense):
@@ -168,7 +160,10 @@ def evaluate_regression(model, loader, device, is_dense, target_mean, target_std
     predictions = torch.cat(predictions)
     targets = torch.cat(targets)
     error = predictions - targets
-    mse = torch.mean(error.pow(2)).item()
+    mse = torch.mean(error.pow(2))
+    if not torch.isfinite(mse):
+        raise FloatingPointError("Non-finite regression MSE during evaluation")
+    mse = mse.item()
     return {
         "mse": mse,
         "rmse": mse ** 0.5,
@@ -222,7 +217,6 @@ def main(
     else:
         dataset = TUDataset(root=data_dir, name=dataset_name)
     output_path = data_dir / f"{dataset_name}.pt"
-    input_dim = max(1, dataset.num_features)
     target_dim = int(dataset[0].y.numel())
     num_classes = dataset.num_classes if task_type != "regression" else target_dim
 
@@ -235,11 +229,17 @@ def main(
         "hosc",
         "justb",
     }
+    if model_name == "diff":
+        logger.info("DiffPool variant: degree-normalized pooled adjacency; pooled self-loops retained")
     # Apply the same graph-size limit to every model so sparse and dense
     # methods process exactly the same dataset and cross-validation splits.
     max_nodes = DENSE_MAX_NODES[dataset_name]
     original_graph_count = len(dataset)
     dataset = [data for data in dataset if data.num_nodes <= max_nodes]
+    if dataset_name == "QM7b":
+        dataset = [prepare_qm7b_graph(data) for data in dataset]
+        logger.info("QM7b input: atomic numbers / 100 and dimensionless Coulomb weights")
+    input_dim = max(1, dataset[0].num_features)
     # Keep graph-level regression targets independent of node padding.
     if task_type == "regression":
         for data in dataset:
@@ -264,8 +264,8 @@ def main(
             graph_target = dense_data.y.clone()
             # DenseGCNConv expects a 2D adjacency matrix per graph, so do not
             # let MUTAG edge features create an extra adjacency dimension.
-            if getattr(dense_data, "edge_attr", None) is not None:
-                dense_data.edge_attr = None
+            dense_data.edge_attr = scalar_edge_weight(dense_data)
+            dense_data.edge_weight = None
             if dense_data.x is None or dense_data.x.size(1) == 0:
                 dense_data.x = torch.ones((dense_data.num_nodes, 1))
             else:
@@ -441,8 +441,9 @@ def main(
             model.reset_pool_timing()
             epoch_start = synchronized_time(device)
             total_loss = 0.0
+            total_graphs = 0
 
-            for batch in train_loader:
+            for batch_number, batch in enumerate(train_loader, start=1):
                 batch = batch.to(device)
                 optimizer.zero_grad()
                 output = forward_model(model, batch, device, is_dense)
@@ -455,14 +456,29 @@ def main(
                     # Pooling auxiliary objectives remain available on the model for
                     # diagnostics but are not added to the training objective.
                 loss = criterion(output, target)
+                context = (
+                    f"{dataset_name}/{model_name}, seed {seed}, fold {fold}, "
+                    f"epoch {epoch}, batch {batch_number}"
+                )
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(f"Non-finite training loss: {context}")
                 loss.backward()
+                finite_gradients = [
+                    torch.isfinite(parameter.grad).all()
+                    for parameter in model.parameters()
+                    if parameter.grad is not None
+                ]
+                if finite_gradients and not torch.stack(finite_gradients).all():
+                    raise FloatingPointError(f"Non-finite training gradients: {context}")
                 optimizer.step()
-                total_loss += loss.item()
+                graph_count = output.size(0)
+                total_loss += loss.item() * graph_count
+                total_graphs += graph_count
 
             # Resolve all pooling events once per epoch, rather than once per batch.
             model.finish_pool_timing()
             run_pool_time += model.last_pool_time
-            average_loss = total_loss / len(train_loader)
+            average_loss = total_loss / total_graphs
             epoch_duration = time.perf_counter() - epoch_start
             run_training_time += epoch_duration
             completed_epochs += 1
@@ -823,7 +839,6 @@ if __name__ == "__main__":
             "kmis",
             "gsap",
             "hgpsl",
-            "hdpsl",
             "pars",
             "diff",
             "mincut",

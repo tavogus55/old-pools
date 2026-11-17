@@ -5,10 +5,10 @@
     "conda_exe": "",
     "python_bin": "",
     "datasets": [
-      "MUTAG"
+      "FreeSolv"
     ],
     "models": [
-      "ndrp"
+      "topk"
     ]
   },
   "tuning": {
