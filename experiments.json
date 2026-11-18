@@ -6,24 +6,13 @@
       "conda_exe": "",
       "python_bin": "",
       "mp_layer": "gcn",
+      "epochs": 10,
+      "seeds": [42, 43],
       "datasets": [
         "PROTEINS"
       ],
       "models": [
-        "diff"
-      ]
-    },
-    {
-      "experiment_name": "default_hyperparameters_graphconv",
-      "conda_env": "rw-env",
-      "conda_exe": "",
-      "python_bin": "",
-      "mp_layer": "graphconv",
-      "datasets": [
-        "PROTEINS"
-      ],
-      "models": [
-        "diff"
+        "sep"
       ]
     }
   ],

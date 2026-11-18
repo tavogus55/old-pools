@@ -2,9 +2,182 @@ import csv
 import json
 import logging
 import os
+import sys
+import tempfile
+import traceback
 
 import numpy as np
 import torch
+
+
+RUN_KEY = ("exp_name", "dataset", "model", "seed", "fold")
+RAW_FIELDS = [
+    "timestamp", "exp_name", "model", "dataset", "task", "seed", "fold",
+    "test_graphs", "end_to_end_time", "training_time", "training_time_per_epoch",
+    "training_epochs", "evaluation_time", "inference_time", "throughput_graphs_per_sec",
+    "pool_time", "training_gpu_memory_mb", "inference_gpu_memory_mb",
+    "peak_gpu_memory_mb", "preprocessing_time",
+] + [f"{split}_{metric}" for metric in ("accuracy", "micro_f1", "macro_f1", "mse", "rmse", "mae")
+     for split in ("validation", "test")]
+FAILURE_FIELDS = [*RUN_KEY, "timestamp", "exception_type", "error", "log_file"]
+
+
+class ResultPersistenceError(RuntimeError):
+    pass
+
+
+def read_csv_rows(path):
+    try:
+        with open(path, newline="", encoding="utf-8") as file:
+            reader = csv.DictReader(file)
+            rows = list(reader)
+            if any(None in row for row in rows):
+                raise ValueError(f"Malformed CSV: {path}")
+            return rows, reader.fieldnames or []
+    except FileNotFoundError:
+        return [], []
+    except Exception as error:
+        raise ResultPersistenceError(f"Could not read results from {path}: {error}") from error
+
+
+def row_key(row, fields=RUN_KEY):
+    return tuple(str(row.get(field, "")) for field in fields)
+
+
+def write_csv_rows(path, rows, fieldnames):
+    temporary_path = None
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w", newline="", encoding="utf-8", delete=False,
+            dir=os.path.dirname(os.path.abspath(path)), suffix=".tmp",
+        ) as file:
+            temporary_path = file.name
+            writer = csv.DictWriter(file, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary_path, path)
+    except Exception as error:
+        raise ResultPersistenceError(f"Could not persist results to {path}: {error}") from error
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+
+def upsert_csv(path, rows, fieldnames, key_fields):
+    existing, existing_fields = read_csv_rows(path)
+    merged = {row_key(row, key_fields): row for row in existing}
+    merged.update((row_key(row, key_fields), row) for row in rows)
+    write_csv_rows(path, list(merged.values()), list(dict.fromkeys(existing_fields + fieldnames)))
+
+
+class ExperimentProgress:
+    def __init__(self, args, task_type, timestamp, logger, save_dir="results"):
+        self.args = args
+        self.task_type = task_type
+        self.timestamp = timestamp
+        self.logger = logger
+        self.save_dir = save_dir
+        self.raw_path = os.path.join(save_dir, f"{args.exp_name}_raw.csv")
+        self.failed_path = os.path.join(save_dir, f"{args.exp_name}_failed.csv")
+        fold_count = min(args.k_folds, args.folds_to_run) if args.folds_to_run > 0 else args.k_folds
+        self.planned = [(seed, fold) for seed in dict.fromkeys(args.seeds)
+                        for fold in range(1, fold_count + 1)]
+        self.results = {}
+        rows, fields = read_csv_rows(self.raw_path)
+        retained = []
+        for row in rows:
+            if self.matches(row):
+                try:
+                    combination = (int(row["seed"]), int(row["fold"]))
+                    numeric_fields = RAW_FIELDS[7:20] + (
+                        [f"{split}_{metric}" for split in ("validation", "test")
+                         for metric in ("mse", "rmse", "mae")]
+                        if task_type == "regression" else
+                        [f"{split}_{metric}" for split in ("validation", "test")
+                         for metric in ("accuracy", "micro_f1", "macro_f1")]
+                    )
+                    complete = (row.get("task") == task_type and bool(row.get("timestamp"))
+                                and all(np.isfinite(float(row[field])) for field in numeric_fields)
+                                and float(row["training_epochs"]) > 0)
+                except (KeyError, ValueError, TypeError):
+                    complete = False
+                if not complete:
+                    continue
+                if combination in self.planned:
+                    self.results[combination] = row
+            retained.append(row)
+        retained = list({row_key(row): row for row in retained}.values())
+        write_csv_rows(self.raw_path, retained, list(dict.fromkeys(fields + RAW_FIELDS)))
+        self.reconcile_failures()
+
+    def matches(self, row):
+        return row_key(row, RUN_KEY[:3]) == (self.args.exp_name, self.args.dataset, self.args.model)
+
+    def reconcile_failures(self):
+        rows, fields = read_csv_rows(self.failed_path)
+        completed_keys = {row_key(row) for row in self.results.values()}
+        unresolved = {row_key(row): row for row in rows if row_key(row) not in completed_keys}
+        write_csv_rows(self.failed_path, list(unresolved.values()),
+                       list(dict.fromkeys(fields + FAILURE_FIELDS)))
+
+    def fail(self, seed, fold, error):
+        log_files = [handler.baseFilename for handler in self.logger.handlers
+                     if isinstance(handler, logging.FileHandler)]
+        row = dict(zip(RUN_KEY, (self.args.exp_name, self.args.dataset, self.args.model, seed, fold)))
+        row.update(timestamp=self.timestamp, exception_type=type(error).__name__,
+                   error=str(error), log_file=";".join(log_files))
+        upsert_csv(self.failed_path, [row], FAILURE_FIELDS, RUN_KEY)
+
+    def report_error(self, message):
+        try:
+            self.logger.exception(message)
+        except Exception:
+            traceback.print_exc()
+            print(message, file=sys.stderr)
+
+    def save(self, max_nodes):
+        rows = list(self.results.values())
+
+        def values(field):
+            return [float(row[field]) for row in rows] or [float("nan")]
+
+        metrics = ({
+            "best_val_mses": values("validation_mse"),
+            "best_test_mses": values("test_mse"),
+            "best_test_rmses": values("test_rmse"),
+            "best_test_maes": values("test_mae"),
+        } if self.task_type == "regression" else {
+            "best_val_accs": values("validation_accuracy"),
+            "best_test_accs": values("test_accuracy"),
+            "best_test_macro_f1s": values("test_macro_f1"),
+        })
+        save_to_csv(
+            args=self.args, task_type=self.task_type, timestamp=self.timestamp,
+            times=values("end_to_end_time"), memories=values("peak_gpu_memory_mb"),
+            max_nodes=max_nodes, end_to_end_times=values("end_to_end_time"),
+            training_times=values("training_time"), evaluation_times=values("evaluation_time"),
+            inference_times=values("inference_time"), training_epoch_counts=values("training_epochs"),
+            training_peak_memories=values("training_gpu_memory_mb"),
+            inference_peak_memories=values("inference_gpu_memory_mb"),
+            test_graph_counts=values("test_graphs"), pool_times=values("pool_time"),
+            preprocessing_times=values("preprocessing_time"), raw_results=rows,
+            save_dir=self.save_dir, **metrics,
+        )
+        self.reconcile_failures()
+
+
+class ResultFileHandler(logging.FileHandler):
+    def handleError(self, record):
+        print("Experiment logging failed; falling back to stderr:", file=sys.stderr)
+        traceback.print_exc()
+        print(logging.Formatter().format(record), file=sys.stderr)
+
+
+class ResultStreamHandler(logging.StreamHandler):
+    handleError = ResultFileHandler.handleError
 
 
 class CustomFormatter(logging.Formatter):
@@ -59,9 +232,9 @@ def get_logger(exp_name, timestamp):
 
     logger = logging.getLogger(f"{model}_{dataset_name}_{exp_name}_{timestamp}")
     if not logger.handlers:
-        file_handler = logging.FileHandler(log_path)
+        file_handler = ResultFileHandler(log_path)
         file_handler.setFormatter(CustomFormatter())
-        console_handler = logging.StreamHandler()
+        console_handler = ResultStreamHandler()
         console_handler.setFormatter(CustomFormatter())
         logger.addHandler(file_handler)
         logger.addHandler(console_handler)
@@ -221,58 +394,18 @@ def save_to_csv(
             "std_macro_f1": std(best_test_macro_f1s),
         })
 
-    fieldnames = list(row.keys())
-    file_exists = os.path.exists(csv_path)
-    summary_already_written = False
-
-    if file_exists:
-        with open(csv_path, "r", newline="") as file:
-            reader = csv.DictReader(file)
-            existing_rows = list(reader)
-            existing_fieldnames = reader.fieldnames or []
-
-        # Rewrite older result files when the timing schema changes, keeping
-        # previous rows and leaving new timing columns blank for them.
-        if existing_fieldnames != fieldnames:
-            with open(csv_path, "w", newline="") as file:
-                writer = csv.DictWriter(file, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(existing_rows)
-                writer.writerow(row)
-            summary_already_written = True
-
-    if not summary_already_written:
-        with open(csv_path, "a", newline="") as file:
-            writer = csv.DictWriter(file, fieldnames=fieldnames)
-            if not file_exists:
-                writer.writeheader()
-            writer.writerow(row)
-
-    # Preserve one full-precision row for every seed-fold run.
-    if raw_results:
+    if raw_results is not None:
+        row["planned_runs"] = len(set(args.seeds)) * (
+            min(args.k_folds, args.folds_to_run)
+            if args.folds_to_run > 0 else args.k_folds
+        )
+        row["successful_runs"] = len(raw_results)
+        if not raw_results:
+            for field in row:
+                if field.startswith(("avg_", "std_", "var_", "peak_", "test_throughput")):
+                    row[field] = ""
+                elif field.startswith("total_"):
+                    row[field] = 0
         raw_csv_path = os.path.join(save_dir, f"{args.exp_name}_raw.csv")
-        raw_fieldnames = list(raw_results[0].keys())
-        raw_file_exists = os.path.exists(raw_csv_path)
-        if raw_file_exists:
-            with open(raw_csv_path, "r", newline="") as file:
-                raw_reader = csv.DictReader(file)
-                existing_raw_rows = list(raw_reader)
-                existing_raw_fieldnames = raw_reader.fieldnames or []
-            if existing_raw_fieldnames != raw_fieldnames:
-                with open(raw_csv_path, "w", newline="") as file:
-                    writer = csv.DictWriter(file, fieldnames=raw_fieldnames)
-                    writer.writeheader()
-                    writer.writerows(existing_raw_rows)
-                    writer.writerows(raw_results)
-                raw_already_written = True
-            else:
-                raw_already_written = False
-        else:
-            raw_already_written = False
-
-        if not raw_already_written:
-            with open(raw_csv_path, "a", newline="") as file:
-                writer = csv.DictWriter(file, fieldnames=raw_fieldnames)
-                if not raw_file_exists:
-                    writer.writeheader()
-                writer.writerows(raw_results)
+        upsert_csv(raw_csv_path, raw_results, RAW_FIELDS, RUN_KEY)
+    upsert_csv(csv_path, [row], list(row), ("exp_name", "dataset", "model"))

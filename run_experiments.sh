@@ -4,11 +4,20 @@ set -euo pipefail
 
 if [[ $# -eq 0 ]]; then
   source "$(dirname -- "${BASH_SOURCE[0]}")/load_runner_config.sh" experiments count
+  failed_experiments=0
   for ((experiment_index = 0; experiment_index < EXPERIMENT_COUNT; experiment_index++)); do
     echo "Starting experiment $((experiment_index + 1))/${EXPERIMENT_COUNT}"
-    bash "${BASH_SOURCE[0]}" "${experiment_index}"
+    if bash "${BASH_SOURCE[0]}" "${experiment_index}"; then
+      :
+    else
+      status=$?
+      if [[ ${status} -eq 130 || ${status} -eq 143 ]]; then exit "${status}"; fi
+      echo "Experiment $((experiment_index + 1)) failed (exit ${status}); continuing queue." >&2
+      failed_experiments=$((failed_experiments + 1))
+    fi
   done
-  echo "All ${EXPERIMENT_COUNT} queued experiments completed."
+  echo "Finished ${EXPERIMENT_COUNT} queued experiments; ${failed_experiments} had failures."
+  if [[ ${failed_experiments} -gt 0 ]]; then exit 1; fi
   exit 0
 fi
 
@@ -120,16 +129,25 @@ echo "Mode: default hyperparameters from main.py (unless explicitly overridden)"
 echo "Dataset-model pairs: ${pair_count}"
 
 combination=0
+failed_pairs=0
 for dataset in "${datasets[@]}"; do
   for model in "${models[@]}"; do
     combination=$((combination + 1))
     echo "Running ${combination}/${pair_count} - ${model} on ${dataset}..."
-    "${PYTHON_BIN}" main.py \
+    if "${PYTHON_BIN}" main.py \
       --dataset "${dataset}" \
       --model "${model}" \
       --exp_name "${EXP_NAME}" \
-      "${training_args[@]}"
+      "${training_args[@]}"; then
+      :
+    else
+      status=$?
+      if [[ ${status} -eq 130 || ${status} -eq 143 ]]; then exit "${status}"; fi
+      echo "Failed ${model} on ${dataset} (exit ${status}); continuing remaining pairs." >&2
+      failed_pairs=$((failed_pairs + 1))
+    fi
   done
 done
 
-echo "All ${pair_count} model/dataset experiments completed."
+echo "Finished ${pair_count} model/dataset experiments; ${failed_pairs} had failures."
+if [[ ${failed_pairs} -gt 0 ]]; then exit 1; fi

@@ -16,7 +16,11 @@ python main.py --dataset DD --model topk --epochs 20
 
 Edit `experiments.json` to configure both Bash runners (Git Bash on Windows, or Bash on Linux). The two sections are independent: there is no shared configuration or experiment name.
 
-- `experiments` is an **ordered list of default-hyperparameter experiments** run by `run_experiments.sh`. Each entry has its own unique experiment name, runtime settings, datasets, and models. All dataset/model pairs in one entry finish before the next entry starts. The queue stops if any training run fails. A single JSON object is still supported for older configurations.
+- `experiments` is an **ordered list of default-hyperparameter experiments** run by `run_experiments.sh`. Each entry has its own unique experiment name, runtime settings, datasets, and models. All dataset/model pairs in one entry finish before the next entry starts. Failed seed-folds, baselines, and entries are reported without stopping the remaining queue. The runner exits nonzero after the queue if any failures remain. A single JSON object is still supported for older configurations.
+
+Results keep the existing paths: `results/<experiment_name>.csv` (summary) and `results/<experiment_name>_raw.csv` (successful seed-folds), plus `results/<experiment_name>_failed.csv` (unresolved failures, exception details, and log paths). Each completed seed-fold is saved immediately. Summary rows are updated in place with `planned_runs` and `successful_runs`, including zero-success and partial experiments. Mixed classification/regression summaries retain both sets of metric columns.
+
+Restart the same command/configuration to skip complete, finite raw-result rows and retry missing, incomplete, or failed seed-folds. Successful retries remove stale failure rows; duplicates are reconciled by experiment/dataset/model/seed/fold. Existing raw CSVs are supported. Raw rows do not contain hyperparameters, so use a new experiment name when changing configurations or evaluation settings. CSV updates use atomic replacement; persistence errors abort the affected pair visibly rather than silently losing results, while the queue continues. Manual interruption still stops the runner. No additional checkpoint files are used.
 - `tuning` configures the **separate hyperparameter-search experiment** run by `run_hyperparameter_tuning.sh`. It has its own experiment name, runtime settings, datasets/models, training budget, initial hyperparameters, and coordinate-search candidate lists. Changing this section cannot change baseline settings.
 
 ```bash

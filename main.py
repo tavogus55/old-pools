@@ -15,7 +15,7 @@ from torch_geometric.transforms import ToDense
 from dataset_loader import CSVMoleculeDataset, prepare_qm7b_graph, scalar_edge_weight
 from pooling_adapters import prepare_sep_dataset
 from pooling_models import CountSketchPooling, DensePool, sparse_pooling
-from utils import get_logger, log_experiment_settings, save_to_csv
+from utils import ExperimentProgress, ResultPersistenceError, get_logger, log_experiment_settings
 
 
 DENSE_MAX_NODES = {
@@ -205,6 +205,54 @@ def main(
     args,
     timestamp: str,
 ) -> None:
+    task_type = "regression" if dataset_name in REGRESSION_DATASETS else "multiclass"
+    progress = ExperimentProgress(args, task_type, timestamp, logger)
+    max_nodes = DENSE_MAX_NODES.get(dataset_name, 0)
+    progress.save(max_nodes)
+    if len(progress.results) == len(progress.planned):
+        logger.info("All %s seed-fold runs already completed; skipping.", len(progress.planned))
+        return
+    try:
+        _run_experiment(
+            dataset_name, model_name, epochs, hidden, pratio, learning_rate,
+            weight_decay, dropout, batch_size, mp_layer, k_folds, seeds,
+            logger, args, timestamp, progress,
+        )
+    except ResultPersistenceError:
+        progress.report_error(f"Could not persist results for {dataset_name}/{model_name}")
+        raise
+    except Exception as error:
+        progress.report_error(f"Experiment setup failed: {dataset_name}/{model_name}")
+        for seed, fold in progress.planned:
+            if (seed, fold) not in progress.results:
+                progress.fail(seed, fold, error)
+        progress.save(max_nodes)
+        raise
+    if len(progress.results) != len(progress.planned):
+        remaining = len(progress.planned) - len(progress.results)
+        raise RuntimeError(
+            f"{dataset_name}/{model_name}: {remaining} unresolved seed-fold failures"
+        )
+
+
+def _run_experiment(
+    dataset_name: str,
+    model_name: str,
+    epochs: int,
+    hidden: int,
+    pratio: float,
+    learning_rate: float,
+    weight_decay: float,
+    dropout: float,
+    batch_size: int,
+    mp_layer: str,
+    k_folds: int,
+    seeds,
+    logger,
+    args,
+    timestamp: str,
+    progress,
+) -> None:
     project_dir = Path(__file__).resolve().parent
     data_dir = project_dir / "data"
 
@@ -311,30 +359,8 @@ def main(
     # partition definition unchanged. The default runs every fold.
     if args.folds_to_run > 0:
         fold_splits = fold_splits[:args.folds_to_run]
-    end_to_end_times = []
-    training_times = []
-    training_epoch_counts = []
-    evaluation_times = []
-    inference_times = []
-    inference_throughputs = []
-    test_graph_counts = []
-    pool_times = []
-    fold_memories = []
-    training_peak_memories = []
-    inference_peak_memories = []
-    fold_metrics = []
-    validation_fold_metrics = []
-    raw_results = []
 
-    total_runs = len(seeds) * len(fold_splits)
-    for run, (seed, fold, (train_val_indices, test_indices)) in enumerate(
-        (
-            (seed, fold_number, split)
-            for seed in seeds
-            for fold_number, split in enumerate(fold_splits, start=1)
-        ),
-        start=1,
-    ):
+    def run_seed_fold(seed, fold, train_val_indices, test_indices):
         set_seed(seed)
         train_val_indices = list(train_val_indices)
         random.shuffle(train_val_indices)
@@ -562,14 +588,11 @@ def main(
         # Training time excludes validation and final test inference. The
         # epoch count reflects early stopping when it terminates a run early.
         training_time = run_training_time
-        training_times.append(training_time)
-        training_epoch_counts.append(completed_epochs)
         training_peak_memory = 0.0
         if device.type == "cuda":
             training_peak_memory = (
                 torch.cuda.max_memory_reserved(device) / (1024 ** 2)
             )
-        training_peak_memories.append(training_peak_memory)
 
         evaluation_start = synchronized_time(device)
 
@@ -604,22 +627,13 @@ def main(
             )
             inference_time = synchronized_time(device) - test_start
         evaluation_time = synchronized_time(device) - evaluation_start
-        evaluation_times.append(evaluation_time)
-        inference_times.append(inference_time)
-        test_graph_counts.append(len(test_dataset))
-        inference_throughputs.append(
-            len(test_dataset) / max(inference_time, 1e-12)
-        )
+        inference_throughput = len(test_dataset) / max(inference_time, 1e-12)
         inference_peak_memory = 0.0
         if device.type == "cuda":
             inference_peak_memory = (
                 torch.cuda.max_memory_reserved(device) / (1024 ** 2)
             )
-        inference_peak_memories.append(inference_peak_memory)
         end_to_end_time = synchronized_time(device) - run_start
-        end_to_end_times.append(end_to_end_time)
-        pool_times.append(run_pool_time)
-        fold_memories.append(max(training_peak_memory, inference_peak_memory))
         logger.info(
             f"Seed {seed}, Fold {fold} timing - "
             f"End-to-end: {end_to_end_time:.2f}s, "
@@ -627,10 +641,8 @@ def main(
             f"Evaluation: {evaluation_time:.2f}s, "
             f"Test inference: {inference_time:.2f}s, "
             f"Training epochs: {completed_epochs}, "
-            f"Throughput: {inference_throughputs[-1]:.2f} graphs/s"
+            f"Throughput: {inference_throughput:.2f} graphs/s"
         )
-        fold_metrics.append(test_metrics)
-        validation_fold_metrics.append(validation_metrics)
         raw_result = {
             "timestamp": timestamp,
             "exp_name": args.exp_name,
@@ -646,7 +658,7 @@ def main(
             "training_epochs": completed_epochs,
             "evaluation_time": evaluation_time,
             "inference_time": inference_time,
-            "throughput_graphs_per_sec": inference_throughputs[-1],
+            "throughput_graphs_per_sec": inference_throughput,
             "pool_time": run_pool_time,
             "training_gpu_memory_mb": training_peak_memory,
             "inference_gpu_memory_mb": inference_peak_memory,
@@ -657,7 +669,6 @@ def main(
         for metric_name in ("accuracy", "micro_f1", "macro_f1", "mse", "rmse", "mae"):
             raw_result[f"validation_{metric_name}"] = validation_metrics.get(metric_name, "")
             raw_result[f"test_{metric_name}"] = test_metrics.get(metric_name, "")
-        raw_results.append(raw_result)
         if task_type == "regression":
             logger.info(
                 f"Seed {seed}, Fold {fold} validation - "
@@ -684,6 +695,52 @@ def main(
                 f"Micro-F1: {test_metrics['micro_f1']:.4f}, "
                 f"Macro-F1: {test_metrics['macro_f1']:.4f}"
             )
+
+        return raw_result
+
+    for seed, fold in progress.planned:
+        if (seed, fold) in progress.results:
+            logger.info("Skipping completed seed %s, fold %s", seed, fold)
+            continue
+        train_val_indices, test_indices = fold_splits[fold - 1]
+        try:
+            raw_result = run_seed_fold(seed, fold, train_val_indices, test_indices)
+        except Exception as error:
+            progress.report_error(f"Seed {seed}, Fold {fold} failed; continuing remaining runs")
+            progress.fail(seed, fold, error)
+            progress.save(max_nodes)
+        else:
+            progress.results[(seed, fold)] = raw_result
+            progress.save(max_nodes)
+        logger.info("Progress: %s/%s successful seed-fold runs",
+                    len(progress.results), len(progress.planned))
+    logger.info("Completed %s/%s seed-fold runs successfully",
+                len(progress.results), len(progress.planned))
+
+    raw_results = list(progress.results.values())
+    if not raw_results:
+        return
+    total_runs = len(raw_results)
+
+    def values(field):
+        return [float(row[field]) for row in raw_results]
+
+    end_to_end_times = values("end_to_end_time")
+    training_times = values("training_time")
+    training_epoch_counts = values("training_epochs")
+    evaluation_times = values("evaluation_time")
+    inference_times = values("inference_time")
+    test_graph_counts = values("test_graphs")
+    pool_times = values("pool_time")
+    fold_memories = values("peak_gpu_memory_mb")
+    training_peak_memories = values("training_gpu_memory_mb")
+    inference_peak_memories = values("inference_gpu_memory_mb")
+    metric_names = (
+        ("mse", "rmse", "mae") if task_type == "regression"
+        else ("accuracy", "micro_f1", "macro_f1")
+    )
+    fold_metrics = [{metric: float(row[f"test_{metric}"]) for metric in metric_names}
+                    for row in raw_results]
 
     total_end_to_end_time = sum(end_to_end_times)
     logger.info(
@@ -756,54 +813,6 @@ def main(
 
     logger.info(f"Loaded {len(dataset)} graphs from the {dataset_name} dataset.")
     logger.info(f"Saved dataset to {output_path}")
-
-    if task_type == "regression":
-        save_to_csv(
-            args=args,
-            task_type="regression",
-            timestamp=timestamp,
-            times=end_to_end_times,
-            memories=fold_memories if fold_memories else [0.0],
-            max_nodes=max_nodes,
-            best_val_mses=[metrics["mse"] for metrics in validation_fold_metrics],
-            best_test_mses=[metrics["mse"] for metrics in fold_metrics],
-            best_test_rmses=[metrics["rmse"] for metrics in fold_metrics],
-            best_test_maes=[metrics["mae"] for metrics in fold_metrics],
-            end_to_end_times=end_to_end_times,
-            training_times=training_times,
-            evaluation_times=evaluation_times,
-            inference_times=inference_times,
-            training_epoch_counts=training_epoch_counts,
-            training_peak_memories=training_peak_memories,
-            inference_peak_memories=inference_peak_memories,
-            test_graph_counts=test_graph_counts,
-            pool_times=pool_times,
-            preprocessing_times=[preprocessing_time],
-            raw_results=raw_results,
-        )
-    else:
-        save_to_csv(
-            args=args,
-            task_type="multiclass",
-            timestamp=timestamp,
-            times=end_to_end_times,
-            memories=fold_memories if fold_memories else [0.0],
-            max_nodes=max_nodes,
-            best_val_accs=[metrics["accuracy"] for metrics in validation_fold_metrics],
-            best_test_accs=[metrics["accuracy"] for metrics in fold_metrics],
-            best_test_macro_f1s=[metrics["macro_f1"] for metrics in fold_metrics],
-            end_to_end_times=end_to_end_times,
-            training_times=training_times,
-            evaluation_times=evaluation_times,
-            inference_times=inference_times,
-            training_epoch_counts=training_epoch_counts,
-            training_peak_memories=training_peak_memories,
-            inference_peak_memories=inference_peak_memories,
-            test_graph_counts=test_graph_counts,
-            pool_times=pool_times,
-            preprocessing_times=[preprocessing_time],
-            raw_results=raw_results,
-        )
 
 
 if __name__ == "__main__":
